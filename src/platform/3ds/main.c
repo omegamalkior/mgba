@@ -291,7 +291,7 @@ static const char* _statusText(struct mGUIRunner* runner) {
 	if (runner->core && runner->core->platform(runner->core) == mPLATFORM_GBA) {
 		struct ARMCore* cpu = runner->core->cpu;
 		if (cpu->jit && ARMJitIsEnabled(cpu)) {
-			return "Dynarec: on";
+			return strstr(ctrJitStatus(), "emulator") ? "Dynarec: on (emulator mode)" : "Dynarec: on";
 		}
 		int dynarec = 1;
 		mCoreConfigGetIntValue(&runner->config, "dynarec", &dynarec);
@@ -1118,8 +1118,12 @@ int main(int argc, char* argv[]) {
 	APT_SetAppCpuTimeLimit(20);
 	runner.autosave.thread = threadCreate(mGUIAutosaveThread, &runner.autosave, 0x2000, 0x1F, 1, false);
 
+	// Only the New 3DS has a core 2. A real Old 3DS refuses the thread anyway,
+	// but some emulators (e.g. Azahar in Old 3DS mode) crash instead.
+	bool isNew3DS = false;
+	APT_CheckNew3DS(&isNew3DS);
 	Thread thread2;
-	if (ThreadCreate(&thread2, _core2Test, NULL) == 0) {
+	if (isNew3DS && ThreadCreate(&thread2, _core2Test, NULL) == 0) {
 		core2 = true;
 		ThreadJoin(&thread2);
 	}

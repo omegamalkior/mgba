@@ -43,6 +43,7 @@
 #include <mgba/internal/arm/isa-inlines.h>
 #include <mgba/internal/arm/isa-thumb.h>
 #include <mgba/internal/gba/gba.h>
+#include <mgba-util/math.h>
 
 #if ARM_JIT_SUPPORTED
 
@@ -60,6 +61,8 @@
 #define JIT_TRAMPOLINE_WORDS 64
 #define JIT_MAX_CHAIN_LINKS 0x8000
 #define JIT_MAX_SLOTS 64
+#define JIT_FAST_BITS 10
+#define JIT_FAST_SIZE (1 << JIT_FAST_BITS)
 
 enum {
 	R0 = 0, R1, R2, R3, R4, R5, R6, R7, R8, R9, R10, R11, R12, RSP, RLR, RPC
@@ -152,6 +155,12 @@ struct ARMJit {
 	size_t nChainLinks;
 
 	struct ARMJitStats stats;
+
+	/* Indirect branch targets: key = guest address | thumb, value = entry */
+	struct {
+		uint32_t key;
+		const uint32_t* entry;
+	} fast[JIT_FAST_SIZE];
 
 	int32_t offCycles;
 	int32_t offNextEvent;
@@ -474,6 +483,7 @@ static void _flush(struct ARMJit* jit, struct ARMCore* cpu) {
 	memset(jit->hash, 0, sizeof(jit->hash));
 	memset(jit->pageHead, 0, sizeof(jit->pageHead));
 	memset(jit->pages, 0, sizeof(jit->pages));
+	memset(jit->fast, 0, sizeof(jit->fast));
 	jit->nBlocks = 0;
 	jit->nLinks = 0;
 	jit->nChainLinks = 0;
@@ -594,6 +604,31 @@ static void _emitChainSlot(struct ARMJitInsnContext* ctx, uint32_t target, int32
 	++e->nSlots;
 }
 
+/* After an instruction that changed the PC to a value only known at run time
+ * (BX, POP {pc}, MOV pc, ...), look the new PC up in the fast table and jump
+ * straight into its block. The handler already synced PC and prefetch. */
+static void _emitIndirectExit(struct ARMJitInsnContext* ctx) {
+	struct ARMJitEmitter* e = ctx->e;
+	struct ARMJit* jit = ctx->jit;
+	_dpReg(e, COND_AL, ALU_CMP, true, 0, R5, R7, SHIFT_LSL, 0);
+	_b(e, COND_GE, jit->exitPlain);
+	_ldr(e, R0, R4, offsetof(struct ARMCore, gprs) + 4 * ARM_PC);
+	_ldr(e, R1, R4, offsetof(struct ARMCore, executionMode));
+	_dpImm(e, COND_AL, ALU_SUB, false, R0, R0, 4);
+	_dpReg(e, COND_AL, ALU_ADD, false, R0, R0, R1, SHIFT_LSL, 1); // Thumb: PC - 2
+	_dpReg(e, COND_AL, ALU_ORR, false, R0, R0, R1, SHIFT_LSL, 0); // key
+	_dpReg(e, COND_AL, ALU_MOV, false, R2, 0, R0, SHIFT_LSL, 32 - (JIT_FAST_BITS + 1));
+	_dpReg(e, COND_AL, ALU_MOV, false, R2, 0, R2, SHIFT_LSR, 32 - (JIT_FAST_BITS + 1) - 2);
+	_dpImm(e, COND_AL, ALU_BIC, false, R2, R2, 7); // index * 8
+	_loadConst(e, R3, (uint32_t) (uintptr_t) jit->fast);
+	_dpReg(e, COND_AL, ALU_ADD, false, R3, R3, R2, SHIFT_LSL, 0);
+	_ldr(e, R12, R3, 0);
+	_dpReg(e, COND_AL, ALU_CMP, true, 0, R12, R0, SHIFT_LSL, 0);
+	_b(e, COND_NE, jit->exitPlain);
+	_ldr(e, R12, R3, 4);
+	_bx(e, R12);
+}
+
 enum {
 	CHAIN_NONE = 0,
 	CHAIN_ALWAYS, // A static branch: leaves the block whenever it executes
@@ -653,7 +688,7 @@ static void _emitHelperCall(struct ARMJitInsnContext* ctx, unsigned cond, uintpt
 		_b(e, COND_GE, jit->exitPlain);
 		_emitChainSlot(ctx, chainTarget, -1);
 	} else if (branchClass) {
-		_b(e, COND_AL, jit->exitPlain);
+		_emitIndirectExit(ctx);
 	} else {
 		uint32_t* notTaken = NULL;
 		if (chain == CHAIN_IF_TAKEN) {
@@ -712,7 +747,7 @@ static void _memReg(struct ARMJitEmitter* e, uint32_t base, unsigned rt, unsigne
 
 /* Address in R0. On entry nothing else is live. Emits the fast path and its
  * event check, and returns the branch site that must lead to the slow path. */
-static uint32_t* _emitFastRam(struct ARMJitInsnContext* ctx, const struct ARMJitFastMem* m, uint32_t** doneSite) {
+static uint32_t* _emitFastRam(struct ARMJitInsnContext* ctx, const struct ARMJitFastMem* m, uint32_t** doneSite, uint32_t** romDoneSite) {
 	struct ARMJitEmitter* e = ctx->e;
 	struct GBA* gba = ctx->gba;
 	uint32_t* slowA;
@@ -720,14 +755,14 @@ static uint32_t* _emitFastRam(struct ARMJitInsnContext* ctx, const struct ARMJit
 	uint32_t* slowC = NULL;
 
 	// r2 = region - 2; only EWRAM (0) and IWRAM (1) are handled here
-	_dpReg(e, COND_AL, ALU_MOV, false, R2, 0, R0, SHIFT_LSR, 24);
-	_dpImm(e, COND_AL, ALU_SUB, false, R2, R2, 2);
-	_dpImm(e, COND_AL, ALU_CMP, true, 0, R2, 1);
-	slowA = _bPlaceholder(e, 0x8); // HI
 	if (!m->store && m->size > 1) {
 		_dpImm(e, COND_AL, ALU_TST, true, 0, R0, m->size - 1);
 		slowB = _bPlaceholder(e, COND_NE);
 	}
+	_dpReg(e, COND_AL, ALU_MOV, false, R2, 0, R0, SHIFT_LSR, 24);
+	_dpImm(e, COND_AL, ALU_SUB, false, R2, R2, 2);
+	_dpImm(e, COND_AL, ALU_CMP, true, 0, R2, 1);
+	slowA = _bPlaceholder(e, 0x8); // HI: not RAM (loads try the ROM path)
 	// r3 = offset into the combined EWRAM+IWRAM buffer
 	_dpImm(e, COND_AL, ALU_CMP, true, 0, R2, 0);
 	_dpReg(e, COND_EQ, ALU_MOV, false, R3, 0, R0, SHIFT_LSL, 14);
@@ -821,10 +856,72 @@ static uint32_t* _emitFastRam(struct ARMJitInsnContext* ctx, const struct ARMJit
 	_cyclesAndCheck(ctx);
 	*doneSite = _bPlaceholder(e, COND_AL);
 
+	uint32_t* romDone = NULL;
+	uint32_t* slowD = NULL;
+	uint32_t* slowE = NULL;
+	if (!m->store) {
+		/* Cartridge ROM (0x08000000-0x0CFFFFFF), inside the ROM image: same
+		 * value and wait states as GBALoad32/16/8, and no prefetch stall since
+		 * the address is past the ROM base. */
+		_patchBranch(slowA, e->ptr);
+		slowA = NULL;
+		_dpImm(e, COND_AL, ALU_SUB, false, R12, R2, GBA_REGION_ROM0 - 2);
+		_dpImm(e, COND_AL, ALU_CMP, true, 0, R12, GBA_REGION_ROM2 - GBA_REGION_ROM0);
+		slowD = _bPlaceholder(e, 0x8); // HI
+		_dpReg(e, COND_AL, ALU_MOV, false, R3, 0, R0, SHIFT_LSL, 7);
+		_dpReg(e, COND_AL, ALU_MOV, false, R3, 0, R3, SHIFT_LSR, 7); // offset in the 32 MiB window
+		_loadConst(e, R12, (uint32_t) (uintptr_t) &gba->memory.romSize);
+		_ldr(e, R12, R12, 0);
+		_dpReg(e, COND_AL, ALU_CMP, true, 0, R3, R12, SHIFT_LSL, 0);
+		slowE = _bPlaceholder(e, 0x2); // HS
+		_loadConst(e, R12, (uint32_t) (uintptr_t) &gba->memory.rom);
+		_ldr(e, R12, R12, 0);
+		switch (m->size) {
+		case 4:
+			_memReg(e, 0x07900000, R1, R12, R3, SHIFT_LSL, 0);
+			break;
+		case 2:
+			_emit(e, (m->sign ? 0xE19000F0 : 0xE19000B0) | (R12 << 16) | (R1 << 12) | R3);
+			break;
+		default:
+			if (m->sign) {
+				_emit(e, 0xE19000D0 | (R12 << 16) | (R1 << 12) | R3);
+			} else {
+				_memReg(e, 0x07D00000, R1, R12, R3, SHIFT_LSL, 0);
+			}
+			break;
+		}
+		_storeGuestReg(ctx, R1, m->guestReg);
+		if (m->writebackReg >= 0) {
+			_addImm(e, R0, R0, m->writebackDelta);
+			_storeGuestReg(ctx, R0, m->writebackReg);
+		}
+		const char* romTable = (m->size == 4) ? gba->memory.waitstatesNonseq32 : gba->memory.waitstatesNonseq16;
+		_loadConst(e, R12, (uint32_t) (uintptr_t) romTable);
+		_dpImm(e, COND_AL, ALU_ADD, false, R2, R2, 2); // region
+		_memReg(e, 0x07D00000, R0, R12, R2, SHIFT_LSL, 0); // ldrb r0, [table, region]
+		_dpImm(e, COND_AL, ALU_ADD, false, R0, R0, 2);
+		_dpReg(e, COND_AL, ALU_ADD, false, R5, R5, R0, SHIFT_LSL, 0);
+		if (ctx->thumb) {
+			_ldr(e, R0, R4, offsetof(struct ARMCore, memory.activeNonseqCycles16));
+			_ldr(e, R1, R4, offsetof(struct ARMCore, memory.activeSeqCycles16));
+		} else {
+			_ldr(e, R0, R4, offsetof(struct ARMCore, memory.activeNonseqCycles32));
+			_ldr(e, R1, R4, offsetof(struct ARMCore, memory.activeSeqCycles32));
+		}
+		_dpReg(e, COND_AL, ALU_ADD, false, R5, R5, R0, SHIFT_LSL, 0);
+		_dpReg(e, COND_AL, ALU_SUB, false, R5, R5, R1, SHIFT_LSL, 0);
+		_cyclesAndCheck(ctx);
+		romDone = _bPlaceholder(e, COND_AL);
+	}
+
 	uint32_t* slowStart = e->ptr;
 	_patchBranch(slowA, slowStart);
+	_patchBranch(slowD, slowStart);
+	_patchBranch(slowE, slowStart);
 	_patchBranch(slowB, slowStart);
 	_patchBranch(slowC, slowStart);
+	*romDoneSite = romDone;
 	return slowStart;
 }
 
@@ -832,9 +929,11 @@ static uint32_t* _emitFastRam(struct ARMJitInsnContext* ctx, const struct ARMJit
  * address is computed by ADDRESS into R0. */
 static void _emitMemoryWithFallback(struct ARMJitInsnContext* ctx, const struct ARMJitFastMem* m, uintptr_t handler) {
 	uint32_t* done = NULL;
-	_emitFastRam(ctx, m, &done);
+	uint32_t* romDone = NULL;
+	_emitFastRam(ctx, m, &done, &romDone);
 	_emitHelperCall(ctx, COND_AL, handler, false, CHAIN_NONE, 0);
 	_patchBranch(done, ctx->e->ptr);
+	_patchBranch(romDone, ctx->e->ptr);
 }
 
 /* Thumb PC-relative load from ROM: the value is a constant */
@@ -929,6 +1028,188 @@ static bool _thumbEmitMemory(struct ARMJitInsnContext* ctx, uint16_t opcode, uin
 		return true;
 	}
 	return false;
+}
+
+
+/* Inline LDM/STM (and Thumb PUSH/POP/LDMIA/STMIA) on EWRAM/IWRAM, following
+ * GBALoadMultiple/GBAStoreMultiple: sequential wait states per word, one extra
+ * cycle for loads, the prefetch stall from ROM, and the handler's N-S cycles.
+ * mode: 0 = IA, 1 = IB, 2 = DA, 3 = DB. */
+static void _emitFastMultiple(struct ARMJitInsnContext* ctx, bool load, unsigned rn, uint16_t mask, unsigned mode,
+                              bool writeback, uintptr_t handler) {
+	struct ARMJitEmitter* e = ctx->e;
+	struct GBA* gba = ctx->gba;
+	unsigned count = popcount32(mask);
+	int32_t start;
+	int32_t delta;
+	switch (mode) {
+	case 0: start = 0; delta = 4 * count; break;
+	case 1: start = 4; delta = 4 * count; break;
+	case 2: start = 4 - 4 * (int32_t) count; delta = -4 * (int32_t) count; break;
+	default: start = -4 * (int32_t) count; delta = -4 * (int32_t) count; break;
+	}
+	uint32_t* slow[6] = {0};
+
+	_loadGuestReg(ctx, R0, rn, 0);
+	if (start) {
+		_addImm(e, R0, R0, start);
+	}
+	_dpImm(e, COND_AL, ALU_TST, true, 0, R0, 3);
+	slow[0] = _bPlaceholder(e, COND_NE);
+	_dpReg(e, COND_AL, ALU_MOV, false, R2, 0, R0, SHIFT_LSR, 24);
+	_dpImm(e, COND_AL, ALU_SUB, false, R2, R2, 2);
+	_dpImm(e, COND_AL, ALU_CMP, true, 0, R2, 1);
+	slow[1] = _bPlaceholder(e, 0x8); // HI
+	_dpImm(e, COND_AL, ALU_CMP, true, 0, R2, 0);
+	_dpReg(e, COND_EQ, ALU_MOV, false, R3, 0, R0, SHIFT_LSL, 14);
+	_dpReg(e, COND_EQ, ALU_MOV, false, R3, 0, R3, SHIFT_LSR, 14);
+	_dpReg(e, COND_NE, ALU_MOV, false, R3, 0, R0, SHIFT_LSL, 17);
+	_dpReg(e, COND_NE, ALU_MOV, false, R3, 0, R3, SHIFT_LSR, 17);
+	_dpImm(e, COND_NE, ALU_ADD, false, R3, R3, ARM_JIT_EWRAM_SIZE);
+	// The whole transfer must stay inside the region (no mirroring wraparound)
+	_addImm(e, R12, R3, 4 * count);
+	_dpImm(e, COND_EQ, ALU_MOV, false, R1, 0, ARM_JIT_EWRAM_SIZE);
+	_dpImm(e, COND_NE, ALU_MOV, false, R1, 0, ARM_JIT_EWRAM_SIZE + ARM_JIT_IWRAM_SIZE);
+	_dpReg(e, COND_AL, ALU_CMP, true, 0, R12, R1, SHIFT_LSL, 0);
+	slow[2] = _bPlaceholder(e, 0x8); // HI
+	if (!load) {
+		_loadConst(e, R12, (uint32_t) (uintptr_t) ctx->jit->pages);
+		_memReg(e, 0x07D00000, R1, R12, R3, SHIFT_LSR, 8); // ldrb r1, [r12, r3, lsr #8]
+		_dpImm(e, COND_AL, ALU_CMP, true, 0, R1, 0);
+		slow[3] = _bPlaceholder(e, COND_NE);
+		_addImm(e, R1, R3, 4 * count - 4);
+		_memReg(e, 0x07D00000, R1, R12, R1, SHIFT_LSR, 8);
+		_dpImm(e, COND_AL, ALU_CMP, true, 0, R1, 0);
+		slow[4] = _bPlaceholder(e, COND_NE);
+	}
+
+	_loadConst(e, R12, (uint32_t) (uintptr_t) gba->memory.wram);
+	_dpReg(e, COND_AL, ALU_ADD, false, R1, R12, R3, SHIFT_LSL, 0);
+	unsigned reg;
+	int32_t offset = 0;
+	for (reg = 0; reg < 16; ++reg) {
+		if (!(mask & (1 << reg))) {
+			continue;
+		}
+		if (load) {
+			_ldr(e, R0, R1, offset);
+			_storeGuestReg(ctx, R0, reg);
+		} else {
+			_loadGuestReg(ctx, R0, reg, 0);
+			_str(e, R0, R1, offset);
+		}
+		offset += 4;
+	}
+	if (writeback) {
+		_loadGuestReg(ctx, R0, rn, 0);
+		_addImm(e, R0, R0, delta);
+		_storeGuestReg(ctx, R0, rn);
+	}
+
+	// Wait: IWRAM = count; EWRAM = (S - N) + count * (S + 1); loads add one more
+	_dpImm(e, COND_AL, ALU_CMP, true, 0, R2, 0);
+	_dpImm(e, COND_NE, ALU_MOV, false, R0, 0, count + (load ? 1 : 0));
+	slow[5] = NULL;
+	{
+		uint32_t* iwramDone = _bPlaceholder(e, COND_NE);
+		_loadConst(e, R12, (uint32_t) (uintptr_t) &gba->memory.waitstatesSeq32[GBA_REGION_EWRAM]);
+		_memImm(e, COND_AL, 0x05500000, R1, R12, 0); // ldrb r1, [r12] (S)
+		_loadConst(e, R12, (uint32_t) (uintptr_t) &gba->memory.waitstatesNonseq32[GBA_REGION_EWRAM]);
+		_memImm(e, COND_AL, 0x05500000, R2, R12, 0); // ldrb r2, [r12] (N)
+		_dpImm(e, COND_AL, ALU_MOV, false, R3, 0, count + 1);
+		_emit(e, 0xE0000000 | (R0 << 16) | (R3 << 8) | 0x90 | R1); // mul r0, r1, r3
+		_dpReg(e, COND_AL, ALU_SUB, false, R0, R0, R2, SHIFT_LSL, 0);
+		_dpImm(e, COND_AL, ALU_ADD, false, R0, R0, count + (load ? 1 : 0));
+		_patchBranch(iwramDone, e->ptr);
+	}
+	if (ctx->block->guestAddress >> 24 >= GBA_REGION_ROM0) {
+		uint32_t* noStall;
+		_loadConst(e, R12, (uint32_t) (uintptr_t) &gba->memory.prefetch);
+		_memImm(e, COND_AL, 0x05500000, R12, R12, 0);
+		_dpImm(e, COND_AL, ALU_CMP, true, 0, R12, 0);
+		noStall = _bPlaceholder(e, COND_EQ);
+		_mov(e, R1, R0);
+		_mov(e, R0, R4);
+		_addImm(e, R2, R10, _pcValue(ctx));
+		_str(e, R2, R4, offsetof(struct ARMCore, gprs) + 4 * ARM_PC);
+		_loadConst(e, R12, (uint32_t) (uintptr_t) gba->cpu->memory.stall);
+		_blx(e, R12);
+		_patchBranch(noStall, e->ptr);
+	}
+	_dpReg(e, COND_AL, ALU_ADD, false, R5, R5, R0, SHIFT_LSL, 0);
+	if (ctx->thumb) {
+		_ldr(e, R0, R4, offsetof(struct ARMCore, memory.activeNonseqCycles16));
+		_ldr(e, R1, R4, offsetof(struct ARMCore, memory.activeSeqCycles16));
+	} else {
+		_ldr(e, R0, R4, offsetof(struct ARMCore, memory.activeNonseqCycles32));
+		_ldr(e, R1, R4, offsetof(struct ARMCore, memory.activeSeqCycles32));
+	}
+	_dpReg(e, COND_AL, ALU_ADD, false, R5, R5, R0, SHIFT_LSL, 0);
+	_dpReg(e, COND_AL, ALU_SUB, false, R5, R5, R1, SHIFT_LSL, 0);
+	_cyclesAndCheck(ctx);
+	uint32_t* done = _bPlaceholder(e, COND_AL);
+
+	unsigned i;
+	for (i = 0; i < sizeof(slow) / sizeof(*slow); ++i) {
+		_patchBranch(slow[i], e->ptr);
+	}
+	_emitHelperCall(ctx, COND_AL, handler, false, CHAIN_NONE, 0);
+	_patchBranch(done, e->ptr);
+}
+
+static bool _thumbEmitMultiple(struct ARMJitInsnContext* ctx, uint16_t opcode, uintptr_t handler) {
+	if ((opcode & 0xFE00) == 0xB400) {
+		// PUSH {rlist[, lr]}
+		uint16_t mask = (opcode & 0xFF) | ((opcode & 0x100) ? (1 << ARM_LR) : 0);
+		if (!mask) {
+			return false;
+		}
+		_emitFastMultiple(ctx, false, ARM_SP, mask, 3, true, handler);
+		return true;
+	}
+	if ((opcode & 0xFF00) == 0xBC00) {
+		// POP {rlist} (without the PC)
+		uint16_t mask = opcode & 0xFF;
+		if (!mask) {
+			return false;
+		}
+		_emitFastMultiple(ctx, true, ARM_SP, mask, 0, true, handler);
+		return true;
+	}
+	if ((opcode & 0xF000) == 0xC000) {
+		unsigned rn = (opcode >> 8) & 7;
+		uint16_t mask = opcode & 0xFF;
+		if (!mask) {
+			return false;
+		}
+		if (opcode & 0x0800) {
+			// LDMIA rn!, {rlist}: no writeback if rn is loaded
+			_emitFastMultiple(ctx, true, rn, mask, 0, !(mask & (1 << rn)), handler);
+		} else {
+			_emitFastMultiple(ctx, false, rn, mask, 0, true, handler);
+		}
+		return true;
+	}
+	return false;
+}
+
+static bool _armEmitMultiple(struct ARMJitInsnContext* ctx, uint32_t opcode, uintptr_t handler) {
+	if ((opcode >> 28) != COND_AL || (opcode & 0x0E000000) != 0x08000000) {
+		return false;
+	}
+	uint16_t mask = opcode & 0xFFFF;
+	unsigned rn = (opcode >> 16) & 0xF;
+	bool load = opcode & 0x00100000;
+	bool writeback = opcode & 0x00200000;
+	if (!mask || (mask & 0x8000) || (opcode & 0x00400000) || rn == ARM_PC) {
+		return false;
+	}
+	unsigned mode = ((opcode & 0x00800000) ? 0 : 2) | ((opcode & 0x01000000) ? 1 : 0);
+	if (load && (mask & (1 << rn))) {
+		writeback = false;
+	}
+	_emitFastMultiple(ctx, load, rn, mask, mode, writeback, handler);
+	return true;
 }
 
 static bool _armEmitMemory(struct ARMJitInsnContext* ctx, uint32_t opcode, uintptr_t handler) {
@@ -1225,7 +1506,7 @@ static void _armEmitInstruction(struct ARMJitInsnContext* ctx, uint32_t opcode, 
 	}
 	bool branchClass = _armIsBranchClass(opcode);
 	ARMInstruction handler = _armTable[((opcode >> 16) & 0xFF0) | ((opcode >> 4) & 0x00F)];
-	if (!branchClass && _armEmitMemory(ctx, opcode, (uintptr_t) handler)) {
+	if (!branchClass && (_armEmitMemory(ctx, opcode, (uintptr_t) handler) || _armEmitMultiple(ctx, opcode, (uintptr_t) handler))) {
 		return;
 	}
 	int chain = CHAIN_NONE;
@@ -1514,7 +1795,7 @@ static void _thumbEmitInstruction(struct ARMJitInsnContext* ctx, uint16_t opcode
 	}
 	bool branchClass = _thumbIsBranchClass(opcode);
 	ThumbInstruction handler = _thumbTable[opcode >> 6];
-	if (!branchClass && _thumbEmitMemory(ctx, opcode, (uintptr_t) handler)) {
+	if (!branchClass && (_thumbEmitMemory(ctx, opcode, (uintptr_t) handler) || _thumbEmitMultiple(ctx, opcode, (uintptr_t) handler))) {
 		return;
 	}
 	uint32_t pcValue = ctx->block->guestAddress + (uint32_t) _pcValue(ctx);
@@ -1822,7 +2103,16 @@ static void _flushCache(struct ARMJit* jit, void* start, size_t size) {
 	}
 }
 
+static inline unsigned _fastIndex(uint32_t key) {
+	return (key >> 1) & (JIT_FAST_SIZE - 1);
+}
+
 static void _unchain(struct ARMJit* jit, struct ARMJitBlock* block) {
+	unsigned index = _fastIndex(block->guestAddress | block->thumb);
+	if (jit->fast[index].entry == block->entry) {
+		jit->fast[index].key = 0;
+		jit->fast[index].entry = NULL;
+	}
 	struct ARMJitChainLink* link = block->incoming;
 	while (link) {
 		*link->slot = link->original;
@@ -1914,6 +2204,9 @@ void ARMJitRunLoop(struct ARMCore* cpu) {
 			}
 			cpu->jitLastSlot = NULL;
 		}
+		unsigned index = _fastIndex(block->guestAddress | block->thumb);
+		jit->fast[index].key = block->guestAddress | block->thumb;
+		jit->fast[index].entry = block->entry;
 		cpu->jitExitRequest = 0;
 		jit->enter(cpu, block->entry);
 		cpu->jitCurrentBlock = NULL;
