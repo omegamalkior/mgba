@@ -921,7 +921,11 @@ int main(int argc, char* argv[]) {
 	u8 model = 0;
 	cfguInit();
 	CFGU_GetSystemModel(&model);
-	if (model != CFG_MODEL_2DS) {
+	// Emulators (Citra/Azahar) don't display the 800-pixel-wide top screen
+	// mode properly, so use the normal width there, like on a 2DS
+	s64 emulatorId = 0;
+	bool emulator = R_SUCCEEDED(svcGetSystemInfo(&emulatorId, 0x20000, 0)) && (emulatorId == 1 || emulatorId == 2);
+	if (model != CFG_MODEL_2DS && !emulator) {
 		gfxSetWide(true);
 	}
 	cfguExit();
