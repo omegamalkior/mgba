@@ -94,6 +94,7 @@ struct mGUIRunner {
 	void (*setFrameLimiter)(struct mGUIRunner*, bool limit);
 	uint16_t (*pollGameInput)(struct mGUIRunner*);
 	bool (*running)(struct mGUIRunner*);
+	const char* (*statusText)(struct mGUIRunner*);
 };
 
 void mGUIInit(struct mGUIRunner*, const char* port);

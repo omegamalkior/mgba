@@ -1,6 +1,7 @@
 include(ExportDirectory)
 set(SOURCE_FILES
 	arm.c
+	jit.c
 	decoder-arm.c
 	decoder.c
 	decoder-thumb.c

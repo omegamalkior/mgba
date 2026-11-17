@@ -5,6 +5,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 #include <mgba/internal/gba/bios.h>
 
+#include <mgba/internal/arm/jit.h>
+
 #include <mgba/internal/arm/isa-inlines.h>
 #include <mgba/internal/arm/macros.h>
 #include <mgba/internal/gba/gba.h>
@@ -41,9 +43,11 @@ static void _RegisterRamReset(struct GBA* gba) {
 	cpu->memory.store16(cpu, GBA_BASE_IO | GBA_REG_DISPCNT, 0x0080, 0);
 	if (registers & 0x01) {
 		memset(gba->memory.wram, 0, GBA_SIZE_EWRAM);
+		ARM_JIT_FLUSH_IF_ACTIVE(cpu);
 	}
 	if (registers & 0x02) {
 		memset(gba->memory.iwram, 0, GBA_SIZE_IWRAM - 0x200);
+		ARM_JIT_FLUSH_IF_ACTIVE(cpu);
 	}
 	if (registers & 0x04) {
 		memset(gba->video.palette, 0, GBA_SIZE_PALETTE_RAM);
