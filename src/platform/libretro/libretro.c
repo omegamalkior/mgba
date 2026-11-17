@@ -66,6 +66,14 @@ static int32_t _readTiltY(struct mRotationSource* source);
 static int32_t _readGyroZ(struct mRotationSource* source);
 
 static struct mCore* core;
+
+#if defined(__3DS__) && defined(M_CORE_GBA)
+#include <mgba/internal/arm/jit.h>
+#ifdef ARM_JIT_SUPPORTED
+#include "../3ds/jit-3ds.h"
+#define LIBRETRO_DYNAREC
+#endif
+#endif
 static mColor* outputBuffer = NULL;
 static int16_t *audioSampleBuffer = NULL;
 static size_t audioSampleBufferSize;
@@ -408,7 +416,12 @@ void retro_get_system_info(struct retro_system_info* info) {
 	info->valid_extensions = "gba";
 #endif
 	info->library_version = projectVersion;
+#ifdef LIBRETRO_DYNAREC
+	// A separate core next to the stock mGBA one, with its own options
+	info->library_name = "mGBA Dynarec";
+#else
 	info->library_name = projectName;
+#endif
 	info->block_extract = false;
 }
 
@@ -542,6 +555,24 @@ void retro_deinit(void) {
 	audioLowPassRightPrev = 0;
 }
 
+#ifdef LIBRETRO_DYNAREC
+/* Turns the GBA dynarec on or off following the "mgba_dynarec" option */
+static void _updateDynarec(void) {
+	if (!core || core->platform(core) != mPLATFORM_GBA) {
+		return;
+	}
+	bool enabled = true;
+	struct retro_variable var = {
+		.key = "mgba_dynarec",
+		.value = 0
+	};
+	if (environCallback(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
+		enabled = strcmp(var.value, "enabled") == 0;
+	}
+	ctrJitAttach(core->cpu, enabled);
+}
+#endif
+
 void retro_run(void) {
 	if (deferredSetup) {
 		_doDeferredSetup();
@@ -573,6 +604,9 @@ void retro_run(void) {
 
 #ifdef M_CORE_GB
 		_updateGbPal();
+#endif
+#ifdef LIBRETRO_DYNAREC
+		_updateDynarec();
 #endif
 	}
 
@@ -927,6 +961,9 @@ bool retro_load_game(const struct retro_game_info* game) {
 	_reloadSettings();
 	core->loadROM(core, rom);
 	deferredSetup = true;
+#ifdef LIBRETRO_DYNAREC
+	_updateDynarec();
+#endif
 
 	const char* sysDir = 0;
 	const char* biosName = 0;

@@ -281,6 +281,22 @@ struct retro_core_option_v2_definition option_defs_us[] = {
       },
       "Remove Known"
    },
+#if defined(__3DS__)
+   {
+      "mgba_dynarec",
+      "Dynarec (GBA)",
+      NULL,
+      "Translate GBA code into native 3DS code instead of interpreting it, for higher speed. Results are identical either way. Turn off if a game misbehaves.",
+      NULL,
+      "performance",
+      {
+         { "enabled",  NULL },
+         { "disabled", NULL },
+         { NULL, NULL },
+      },
+      "enabled"
+   },
+#endif
    {
       "mgba_frameskip",
       "Frameskip",
