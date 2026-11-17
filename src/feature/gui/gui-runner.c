@@ -817,6 +817,21 @@ bool mGUIGetRom(struct mGUIRunner* runner, char* out, size_t outLength) {
 	if (size <= 0) {
 		return false;
 	}
+#ifdef __3DS__
+	// A filename starting with '/' points to a game on the SD card instead of
+	// one packed inside the app, so a small shortcut app can open it directly.
+	// Saves then stay next to the game, as when it's opened from the menu.
+	if (out[len] == '/') {
+		if (len + size < outLength) {
+			out[len + size] = '\0';
+		}
+		if (out[len + size - 1] == '\n' || out[len + size - 1] == '\r') {
+			out[len + size - 1] = '\0';
+		}
+		memmove(out, out + len, strlen(out + len) + 1);
+		return true;
+	}
+#endif
 	char basedir[64];
 	mCoreConfigDirectory(basedir, sizeof(basedir));
 	strlcat(basedir, "/forwarders", sizeof(basedir));
