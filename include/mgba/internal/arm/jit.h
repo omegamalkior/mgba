@@ -12,7 +12,7 @@ CXX_GUARD_START
 
 struct ARMCore;
 
-#define ARM_JIT_PAGE_SHIFT 8
+#define ARM_JIT_PAGE_SHIFT 6
 #define ARM_JIT_EWRAM_SIZE 0x40000
 #define ARM_JIT_IWRAM_SIZE 0x8000
 #define ARM_JIT_RAM_PAGES ((ARM_JIT_EWRAM_SIZE + ARM_JIT_IWRAM_SIZE) >> ARM_JIT_PAGE_SHIFT)
@@ -44,7 +44,7 @@ void ARMJitDeinit(struct ARMCore* cpu);
 void ARMJitSetEnabled(struct ARMCore* cpu, bool enabled);
 bool ARMJitIsEnabled(struct ARMCore* cpu);
 void ARMJitFlush(struct ARMCore* cpu);
-void ARMJitInvalidatePage(struct ARMCore* cpu, unsigned page);
+void ARMJitInvalidateWrite(struct ARMCore* cpu, unsigned offset);
 void ARMJitRunLoop(struct ARMCore* cpu);
 const struct ARMJitStats* ARMJitGetStats(struct ARMCore* cpu);
 
@@ -55,7 +55,7 @@ const struct ARMJitStats* ARMJitGetStats(struct ARMCore* cpu);
 		if (UNLIKELY((CPU)->jitCodePages != NULL)) { \
 			unsigned _jitPage = (unsigned) (OFFSET) >> ARM_JIT_PAGE_SHIFT; \
 			if (UNLIKELY((CPU)->jitCodePages[_jitPage])) { \
-				ARMJitInvalidatePage((CPU), _jitPage); \
+				ARMJitInvalidateWrite((CPU), (unsigned) (OFFSET)); \
 			} \
 		} \
 	} while (0)

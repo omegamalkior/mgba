@@ -84,7 +84,10 @@ static bool _rosalina = false;
 static bool _emulator = false;
 static const char* _status = "Not started";
 
+unsigned ctrJitFlushCount = 0;
+size_t ctrJitCacheSize(void) { return _execSize; }
 static void _flush(void* start, size_t size) {
+	++ctrJitFlushCount;
 	if (_emulator) {
 		// Emulators translate guest code themselves; just tell them it changed
 		ctrJitInvalidateICacheRange(start, size);
@@ -111,9 +114,14 @@ static bool _initMemory(void) {
 	// Citra/Azahar answer this with 1 or 2; real hardware returns an error
 	_emulator = R_SUCCEEDED(svcGetSystemInfo(&emulatorId, 0x20000, 0)) && (emulatorId == 1 || emulatorId == 2);
 
-	static const size_t sizes[] = { 0x400000, 0x200000, 0x100000 };
-	size_t i;
-	for (i = 0; i < sizeof(sizes) / sizeof(*sizes) && !_backing; ++i) {
+	// Bigger games (e.g. Metroid Fusion) need more than 4 MiB of translated
+	// code; with too little the cache keeps filling up and everything gets
+	// recompiled. The New 3DS (and emulators) have the memory to spare.
+	bool isNew3DS = false;
+	APT_CheckNew3DS(&isNew3DS);
+	static const size_t sizes[] = { 0x1000000, 0x800000, 0x400000, 0x200000, 0x100000 };
+	size_t i = (isNew3DS || _emulator) ? 0 : 2;
+	for (; i < sizeof(sizes) / sizeof(*sizes) && !_backing; ++i) {
 		_backing = memalign(0x1000, sizes[i]);
 		if (_backing) {
 			_execSize = sizes[i];
