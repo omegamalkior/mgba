@@ -25,6 +25,9 @@
 #include <mgba-util/platform/3ds/3ds-vfs.h>
 #include <mgba-util/threading.h>
 #include "ctr-gpu.h"
+#include "jit-3ds.h"
+#include <mgba/internal/arm/arm.h>
+#include <mgba/internal/arm/jit.h>
 
 #include <3ds.h>
 #include <3ds/gpu/gx.h>
@@ -270,6 +273,40 @@ static void _resetCamera(struct m3DSImageSource* imageSource) {
 	CAMU_SetAutoWhiteBalance(imageSource->cam, false);
 }
 
+static void _updateDynarec(struct mGUIRunner* runner) {
+#ifdef M_CORE_GBA
+	if (runner->core->platform(runner->core) != mPLATFORM_GBA) {
+		return;
+	}
+	int dynarec = 1;
+	mCoreConfigGetIntValue(&runner->config, "dynarec", &dynarec);
+	ctrJitAttach(runner->core->cpu, dynarec);
+#else
+	UNUSED(runner);
+#endif
+}
+
+static const char* _statusText(struct mGUIRunner* runner) {
+#ifdef M_CORE_GBA
+	if (runner->core && runner->core->platform(runner->core) == mPLATFORM_GBA) {
+		struct ARMCore* cpu = runner->core->cpu;
+		if (cpu->jit && ARMJitIsEnabled(cpu)) {
+			return "Dynarec: on";
+		}
+		int dynarec = 1;
+		mCoreConfigGetIntValue(&runner->config, "dynarec", &dynarec);
+		if (!dynarec) {
+			return "Dynarec: off";
+		}
+		static char buffer[64];
+		snprintf(buffer, sizeof(buffer), "Dynarec: unavailable (%s)", ctrJitStatus());
+		return buffer;
+	}
+#endif
+	UNUSED(runner);
+	return NULL;
+}
+
 static void _setup(struct mGUIRunner* runner) {
 	if (core2) {
 		mCoreConfigSetDefaultIntValue(&runner->config, "threadedVideo", 1);
@@ -315,6 +352,7 @@ static void _setup(struct mGUIRunner* runner) {
 	frameLimiter = true;
 
 	runner->core->setAudioBufferSize(runner->core, AUDIO_SAMPLES);
+	_updateDynarec(runner);
 }
 
 static void _gameLoaded(struct mGUIRunner* runner) {
@@ -399,6 +437,8 @@ static void _gameLoaded(struct mGUIRunner* runner) {
 	if (mCoreConfigGetIntValue(&runner->config, "sgb.borderCrop", &fakeBool)) {
 		sgbCrop = fakeBool;
 	}
+
+	_updateDynarec(runner);
 }
 
 static void _gameUnloaded(struct mGUIRunner* runner) {
@@ -983,6 +1023,15 @@ int main(int argc, char* argv[]) {
 				},
 				.nStates = 2
 			},
+			{
+				.title = "Dynarec (experimental)",
+				.data = GUI_V_S("dynarec"),
+				.state = 1,
+				.validStates = (const char*[]) {
+					"Off", "On"
+				},
+				.nStates = 2
+			},
 #endif
 
 			{
@@ -1040,7 +1089,7 @@ int main(int argc, char* argv[]) {
 			}
 		},
 #ifdef M_CORE_GBA
-		.nConfigExtra = 4,
+		.nConfigExtra = 5,
 #else
 		.nConfigExtra = 5,
 #endif
@@ -1056,7 +1105,8 @@ int main(int argc, char* argv[]) {
 		.incrementScreenMode = _incrementScreenMode,
 		.setFrameLimiter = _setFrameLimiter,
 		.pollGameInput = _pollGameInput,
-		.running = _running
+		.running = _running,
+		.statusText = _statusText
 	};
 
 	runner.autosave.pending = false;
