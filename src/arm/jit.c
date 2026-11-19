@@ -34,7 +34,7 @@
  *   r8  = guest flags in bits 31-28
  *   r9  = host pointer to the block's guest code
  *   r10 = guest address of the block's first instruction
- *   r11 = the block's constant pool
+ *   r11 = &gba->memory.lastPrefetchedPc
  */
 #ifdef JITLOG
 #include <stdio.h>
@@ -131,7 +131,8 @@ struct ARMJitBlock {
 	uint32_t ramStart; // byte range in the combined EWRAM+IWRAM buffer (RAM blocks)
 	uint32_t ramEnd;
 	const uint8_t* hostCode;
-	const uint32_t* entry;
+	const uint32_t* entry; // sets up r6, r9 and r10
+	const uint32_t* fastEntry; // for jumps that leave those right for this block
 	struct ARMJitBlock* nextInHash;
 	struct ARMJitChainLink* incoming;
 };
@@ -175,6 +176,7 @@ struct ARMJit {
 	uint32_t* multiPrepStub[2]; // [store]
 	uint32_t* multiDoneStub[2][2][2]; // [thumb][running from ROM][load]
 	uint32_t* romLiteralStub;
+	uint32_t* indirectExitStub;
 
 	struct ARMJitBlock* hash[JIT_HASH_SIZE];
 	struct ARMJitBlock* blocks;
@@ -228,8 +230,14 @@ struct ARMJitEmitter {
 	bool overflow;
 	/* Where the guest NZCV flags are right now (see _flagsNeedHost etc.) */
 	int flags;
+	/* Constants loaded PC-relative from a pool right after the block body */
 	uint32_t consts[JIT_MAX_CONSTS];
 	unsigned nConsts;
+	struct {
+		uint32_t* site;
+		unsigned index;
+	} constUses[JIT_MAX_CONSTS];
+	unsigned nConstUses;
 	struct {
 		uint32_t* site;
 		unsigned insn;
@@ -240,6 +248,7 @@ struct ARMJitEmitter {
 		uint32_t target;
 		bool synced; // PC and prefetch are already in the CPU struct
 		int32_t pcAfter; // else: guest PC value to sync, relative to r10
+		bool fast; // r9 and r10 were moved to the target: jump to its fastEntry
 	} slots[JIT_MAX_SLOTS];
 	unsigned nSlots;
 	/* Event exits that sync an arbitrary guest PC value (native branches) */
@@ -514,6 +523,25 @@ static void _addImm(struct ARMJitEmitter* e, unsigned rd, unsigned rn, int32_t v
 	}
 }
 
+/* How many instructions _addImm needs for VALUE */
+static unsigned _addImmCost(int32_t value) {
+	uint32_t imm;
+	if (_encodeImm((uint32_t) value, &imm) || _encodeImm((uint32_t) -value, &imm)) {
+		return 1;
+	}
+	uint32_t v = value < 0 ? (uint32_t) -value : (uint32_t) value;
+	unsigned n = 0;
+	int bit = 0;
+	while (v) {
+		while (!(v & (3u << bit))) {
+			bit += 2;
+		}
+		v &= ~(0xFFu << bit);
+		++n;
+	}
+	return n;
+}
+
 static void _loadConst(struct ARMJitEmitter* e, unsigned rd, uint32_t value) {
 	uint32_t imm;
 	if (_encodeImm(value, &imm)) {
@@ -522,6 +550,10 @@ static void _loadConst(struct ARMJitEmitter* e, unsigned rd, uint32_t value) {
 	}
 	if (_encodeImm(~value, &imm)) {
 		_dpImm(e, COND_AL, ALU_MVN, false, rd, 0, ~value);
+		return;
+	}
+	if (e->cold) {
+		_ldrLiteral(e, rd, value);
 		return;
 	}
 	unsigned i;
@@ -537,7 +569,35 @@ static void _loadConst(struct ARMJitEmitter* e, unsigned rd, uint32_t value) {
 		}
 		e->consts[e->nConsts++] = value;
 	}
-	_ldr(e, rd, R11, (int32_t) i * 4);
+	if (e->nConstUses >= JIT_MAX_CONSTS) {
+		e->overflow = true;
+		return;
+	}
+	e->constUses[e->nConstUses].site = e->ptr;
+	e->constUses[e->nConstUses].index = i;
+	++e->nConstUses;
+	_emit(e, 0xE59F0000 | (rd << 12)); // ldr rd, [pc, #...], offset filled in by _emitConstPool
+}
+
+/* The pool for _loadConst, placed after the block body */
+static void _emitConstPool(struct ARMJitEmitter* e) {
+	uint32_t* pool = e->ptr;
+	unsigned i;
+	for (i = 0; i < e->nConsts; ++i) {
+		_emit(e, e->consts[i]);
+	}
+	if (e->overflow) {
+		return;
+	}
+	for (i = 0; i < e->nConstUses; ++i) {
+		uint32_t* site = e->constUses[i].site;
+		int32_t offset = (int32_t) ((pool + e->constUses[i].index - (site + 2)) * 4);
+		if (offset < 0 || offset > 0xFFF) {
+			e->overflow = true;
+			return;
+		}
+		*site |= (uint32_t) offset;
+	}
 }
 
 /* ---------------------------------------------------------------------------
@@ -985,6 +1045,32 @@ static uint32_t* _buildRomLiteralStub(struct ARMJitEmitter* e, struct GBA* gba) 
 	return entry;
 }
 
+/* After an instruction that changed the PC to a value only known at run time:
+ * look the new PC up in the fast table and jump to its block, or leave. */
+static uint32_t* _buildIndirectExitStub(struct ARMJit* jit, struct ARMJitEmitter* e) {
+	uint32_t* litFast = e->ptr;
+	_emit(e, (uint32_t) (uintptr_t) jit->fast);
+	uint32_t* entry = e->ptr;
+	_dpReg(e, COND_AL, ALU_CMP, true, 0, R5, R7, SHIFT_LSL, 0);
+	_b(e, COND_GE, jit->exitPlain);
+	_ldr(e, R0, R4, offsetof(struct ARMCore, gprs) + 4 * ARM_PC);
+	_ldr(e, R1, R4, offsetof(struct ARMCore, executionMode));
+	_dpImm(e, COND_AL, ALU_SUB, false, R0, R0, 4);
+	_dpReg(e, COND_AL, ALU_ADD, false, R0, R0, R1, SHIFT_LSL, 1); // Thumb: PC - 2
+	_dpReg(e, COND_AL, ALU_ORR, false, R0, R0, R1, SHIFT_LSL, 0); // key
+	_dpReg(e, COND_AL, ALU_MOV, false, R2, 0, R0, SHIFT_LSL, 32 - (JIT_FAST_BITS + 1));
+	_dpReg(e, COND_AL, ALU_MOV, false, R2, 0, R2, SHIFT_LSR, 32 - (JIT_FAST_BITS + 1) - 2);
+	_dpImm(e, COND_AL, ALU_BIC, false, R2, R2, 7); // index * 8
+	_ldrNear(e, R3, litFast);
+	_dpReg(e, COND_AL, ALU_ADD, false, R3, R3, R2, SHIFT_LSL, 0);
+	_ldr(e, R12, R3, 0);
+	_dpReg(e, COND_AL, ALU_CMP, true, 0, R12, R0, SHIFT_LSL, 0);
+	_b(e, COND_NE, jit->exitPlain);
+	_ldr(e, R12, R3, 4);
+	_bx(e, R12);
+	return entry;
+}
+
 static bool _buildTrampolines(struct ARMJit* jit, struct GBA* gba) {
 	struct ARMJitEmitter e = {0};
 	e.start = jit->mem;
@@ -992,9 +1078,14 @@ static bool _buildTrampolines(struct ARMJit* jit, struct GBA* gba) {
 	e.end = jit->mem + JIT_TRAMPOLINE_WORDS;
 
 	// enter(cpu, code)
+	uint32_t* litLastPrefetchedPc = e.ptr;
+	_emit(&e, (uint32_t) (uintptr_t) &gba->memory.lastPrefetchedPc);
 	jit->enter = (ARMJitEnter) (uintptr_t) e.ptr;
 	_push(&e, 0x5FF0); // r4-r12, lr
 	_mov(&e, R4, R0);
+	_ldrNear(&e, R11, litLastPrefetchedPc);
+	// Only blocks in RAM name themselves; anything non-NULL means "in a block"
+	_str(&e, R4, R4, jit->offCurrentBlock);
 	_ldr(&e, R5, R4, jit->offCycles);
 	_ldr(&e, R7, R4, jit->offNextEvent);
 	_ldr(&e, R8, R4, jit->offCpsr);
@@ -1043,6 +1134,7 @@ static bool _buildTrampolines(struct ARMJit* jit, struct GBA* gba) {
 	jit->multiPrepStub[0] = _buildMultiPrepStub(jit, &e, gba, false);
 	jit->multiPrepStub[1] = _buildMultiPrepStub(jit, &e, gba, true);
 	jit->romLiteralStub = _buildRomLiteralStub(&e, gba);
+	jit->indirectExitStub = _buildIndirectExitStub(jit, &e);
 
 	return !e.overflow;
 }
@@ -1147,6 +1239,8 @@ struct ARMJitInsnContext {
 	uint32_t bl1Value;
 };
 
+static bool _sameMapping(const struct ARMJitInsnContext* ctx, uint32_t target);
+
 static int32_t _pcValue(const struct ARMJitInsnContext* ctx) {
 	// Value of the guest PC register while the instruction executes
 	return ctx->thumb ? (int32_t) (ctx->index * 2 + 4) : (int32_t) (ctx->index * 4 + 8);
@@ -1240,10 +1334,21 @@ static void _emitChainSlot(struct ARMJitInsnContext* ctx, uint32_t target, bool 
 		}
 		return;
 	}
+	/* A jump within the mapping can make r9 and r10 right for the target here,
+	 * so that the target need not load them (see _compile) */
+	bool fast = false;
+	int32_t delta = (int32_t) (target - ctx->block->guestAddress);
+	if (!synced && _sameMapping(ctx, target) && _addImmCost(delta) <= 2) {
+		fast = true;
+		_addImm(e, R10, R10, delta);
+		_addImm(e, R9, R9, delta);
+		pcAfter -= delta;
+	}
 	e->slots[e->nSlots].site = _bPlaceholder(e, COND_AL);
 	e->slots[e->nSlots].target = target | (ctx->thumb ? 1 : 0);
 	e->slots[e->nSlots].synced = synced;
 	e->slots[e->nSlots].pcAfter = pcAfter;
+	e->slots[e->nSlots].fast = fast;
 	++e->nSlots;
 }
 
@@ -1252,25 +1357,8 @@ static void _emitChainSlot(struct ARMJitInsnContext* ctx, uint32_t target, bool 
  * straight into its block. The handler already synced PC and prefetch. */
 static void _emitIndirectExit(struct ARMJitInsnContext* ctx) {
 	struct ARMJitEmitter* e = ctx->e;
-	struct ARMJit* jit = ctx->jit;
 	_flagsClobber(e);
-	_dpReg(e, COND_AL, ALU_CMP, true, 0, R5, R7, SHIFT_LSL, 0);
-	_b(e, COND_GE, jit->exitPlain);
-	_ldr(e, R0, R4, offsetof(struct ARMCore, gprs) + 4 * ARM_PC);
-	_ldr(e, R1, R4, offsetof(struct ARMCore, executionMode));
-	_dpImm(e, COND_AL, ALU_SUB, false, R0, R0, 4);
-	_dpReg(e, COND_AL, ALU_ADD, false, R0, R0, R1, SHIFT_LSL, 1); // Thumb: PC - 2
-	_dpReg(e, COND_AL, ALU_ORR, false, R0, R0, R1, SHIFT_LSL, 0); // key
-	_dpReg(e, COND_AL, ALU_MOV, false, R2, 0, R0, SHIFT_LSL, 32 - (JIT_FAST_BITS + 1));
-	_dpReg(e, COND_AL, ALU_MOV, false, R2, 0, R2, SHIFT_LSR, 32 - (JIT_FAST_BITS + 1) - 2);
-	_dpImm(e, COND_AL, ALU_BIC, false, R2, R2, 7); // index * 8
-	_loadConst(e, R3, (uint32_t) (uintptr_t) jit->fast);
-	_dpReg(e, COND_AL, ALU_ADD, false, R3, R3, R2, SHIFT_LSL, 0);
-	_ldr(e, R12, R3, 0);
-	_dpReg(e, COND_AL, ALU_CMP, true, 0, R12, R0, SHIFT_LSL, 0);
-	_b(e, COND_NE, jit->exitPlain);
-	_ldr(e, R12, R3, 4);
-	_bx(e, R12);
+	_b(e, COND_AL, ctx->jit->indirectExitStub);
 }
 
 /* A branch to a fixed TARGET can skip the interpreter when all its handler
@@ -1287,6 +1375,15 @@ static bool _canBranchNatively(const struct ARMJitInsnContext* ctx, uint32_t tar
 	if (gba->idleOptimization >= IDLE_LOOP_REMOVE && target == gba->idleLoop) {
 		return false;
 	}
+	return _sameMapping(ctx, target);
+}
+
+/* Whether TARGET is in the same region and mirror as the block and inside the
+ * mapped memory, so that r9 and r10 moved by the distance are right for it */
+static bool _sameMapping(const struct ARMJitInsnContext* ctx, uint32_t target) {
+	struct GBA* gba = ctx->gba;
+	uint32_t from = ctx->block->guestAddress;
+	unsigned width = ctx->thumb ? 2 : 4;
 	if (target & (width - 1)) {
 		return false;
 	}
@@ -1337,13 +1434,13 @@ static void _emitNativeBranch(struct ARMJitInsnContext* ctx, uint32_t target, ui
 	struct GBA* gba = ctx->gba;
 	unsigned width = ctx->thumb ? 2 : 4;
 	int32_t pcAfter = (int32_t) (target + width - ctx->block->guestAddress);
+	UNUSED(gba);
 	if (link) {
-		_loadConst(e, R0, link);
+		_addImm(e, R0, R10, (int32_t) (link - ctx->block->guestAddress));
 		_storeGuestReg(ctx, R0, ARM_LR);
 	}
-	_loadConst(e, R12, (uint32_t) (uintptr_t) &gba->memory.lastPrefetchedPc);
 	_dpImm(e, COND_AL, ALU_MOV, false, R0, 0, 0);
-	_str(e, R0, R12, 0);
+	_str(e, R0, R11, 0);
 	_ldr(e, R0, R4, ctx->thumb ? offsetof(struct ARMCore, memory.activeNonseqCycles16) : offsetof(struct ARMCore, memory.activeNonseqCycles32));
 	_dpReg(e, COND_AL, ALU_ADD, false, R5, R5, R6, SHIFT_LSL, 1);
 	_dpImm(e, COND_AL, ALU_ADD, false, R0, R0, 1);
@@ -1485,7 +1582,12 @@ static void _emitMemoryWithFallback(struct ARMJitInsnContext* ctx, const struct 
 static void _emitThumbRomLiteral(struct ARMJitInsnContext* ctx, unsigned rd, uint32_t address, uint32_t value) {
 	struct ARMJitEmitter* e = ctx->e;
 	_flagsClobber(e);
-	_loadConst(e, R1, value);
+	uint32_t offset = address - ctx->block->guestAddress;
+	if (offset <= 0xFFC && _sameMapping(ctx, address)) {
+		_ldr(e, R1, R9, (int32_t) offset); // straight from the ROM image
+	} else {
+		_loadConst(e, R1, value);
+	}
 	_storeGuestReg(ctx, R1, rd);
 	_dpImm(e, COND_AL, ALU_MOV, false, R0, 0, address >> 24);
 	_bl(e, ctx->jit->romLiteralStub);
@@ -1562,7 +1664,7 @@ static bool _thumbEmitMemory(struct ARMJitInsnContext* ctx, uint16_t opcode, uin
 		}
 		m.size = 4;
 		m.guestReg = reg;
-		_loadConst(e, R0, address);
+		_addImm(e, R0, R10, (int32_t) (address - ctx->block->guestAddress));
 		_emitMemoryWithFallback(ctx, &m, handler);
 		return true;
 	}
@@ -2260,7 +2362,7 @@ static bool _thumbEmitNativeInstruction(struct ARMJitInsnContext* ctx, uint16_t 
 			} else {
 				// ADD rd, PC, #imm
 				uint32_t value = ((ctx->block->guestAddress + (uint32_t) _pcValue(ctx)) & ~3u) + imm;
-				_loadConst(e, R0, value);
+				_addImm(e, R0, R10, (int32_t) (value - ctx->block->guestAddress));
 			}
 			_storeGuestReg(ctx, R0, reg);
 			_nativeCycles(ctx);
@@ -2281,7 +2383,7 @@ static bool _thumbEmitNativeInstruction(struct ARMJitInsnContext* ctx, uint16_t 
 			// BL prefix: LR = PC + (offset << 12)
 			int32_t offset = (int32_t) ((uint32_t) (opcode & 0x7FF) << 21) >> 9;
 			uint32_t value = ctx->block->guestAddress + (uint32_t) _pcValue(ctx) + (uint32_t) offset;
-			_loadConst(e, R0, value);
+			_addImm(e, R0, R10, (int32_t) (value - ctx->block->guestAddress));
 			_storeGuestReg(ctx, R0, ARM_LR);
 			_nativeCycles(ctx);
 			return true;
@@ -2405,6 +2507,7 @@ static void _resetEmitter(struct ARMJitEmitter* e) {
 	e->overflow = false;
 	e->flags = FLAGS_R8;
 	e->nConsts = 0;
+	e->nConstUses = 0;
 	e->nStubFixups = 0;
 	e->nSlots = 0;
 	e->nExits = 0;
@@ -2551,6 +2654,7 @@ static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uin
 	maxInsns = _splitPoint(jit, block->hostCode, address, thumb, maxInsns);
 
 	struct ARMJitEmitter* e = jit->emitter;
+retry:
 	_resetEmitter(e);
 	e->start = jit->codePtr;
 	e->ptr = jit->codePtr;
@@ -2559,19 +2663,22 @@ static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uin
 	e->otherEnd = jit->coldPtr + JIT_MAX_BLOCK_WORDS;
 	e->cold = false;
 
-	// Header: host code pointer, guest address, constant pool
-	uint32_t* header = e->ptr;
+	/* Header: host code pointer and guest address. The full entry loads them
+	 * and r6. A jump from a block in the same mapping and mode has r6 right
+	 * already and moves r9 and r10 itself, so it skips to the fast entry. */
 	_emit(e, (uint32_t) (uintptr_t) block->hostCode);
 	_emit(e, address);
-	_emit(e, 0);
 	block->entry = e->ptr;
-	_emit(e, 0xE51F9014); // ldr r9, [pc, #-20]
-	_emit(e, 0xE51FA014); // ldr r10, [pc, #-20]
-	_emit(e, 0xE51FB014); // ldr r11, [pc, #-20]
+	_emit(e, 0xE51F9010); // ldr r9, [pc, #-16]
+	_emit(e, 0xE51FA010); // ldr r10, [pc, #-16]
 	_ldr(e, R6, R4, thumb ? jit->offSeq16 : jit->offSeq32);
 	_dpImm(e, COND_AL, ALU_ADD, false, R6, R6, 1);
-	_loadConst(e, R0, (uint32_t) (uintptr_t) block);
-	_str(e, R0, R4, jit->offCurrentBlock);
+	block->fastEntry = e->ptr;
+	if (block->ram) {
+		// Lets a store into this block's own code stop it (ARMJitInvalidateWrite)
+		_loadConst(e, R0, (uint32_t) (uintptr_t) block);
+		_str(e, R0, R4, jit->offCurrentBlock);
+	}
 
 	struct ARMJitInsnContext ctx = {
 		.jit = jit,
@@ -2639,6 +2746,7 @@ static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uin
 		_emitChainSlot(&ctx, address + i * (thumb ? 2 : 4), false, _pcValue(&ctx));
 	}
 
+	_emitConstPool(e);
 #ifdef JITDBG
 	uint32_t* dbgTail = e->ptr;
 #endif
@@ -2692,7 +2800,7 @@ static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uin
 	// Chain slot exits: remember which slot we left through, then leave
 	for (f = 0; f < e->nSlots; ++f) {
 		uint32_t* stub = e->ptr;
-		_loadConst(e, R1, (uint32_t) (uintptr_t) e->slots[f].site);
+		_loadConst(e, R1, (uint32_t) (uintptr_t) e->slots[f].site | (e->slots[f].fast ? 1 : 0));
 		_str(e, R1, R4, jit->offLastSlot);
 		_loadConst(e, R1, e->slots[f].target);
 		_str(e, R1, R4, jit->offLastSlotTarget);
@@ -2733,17 +2841,16 @@ static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uin
 		_b(e, COND_AL, thumb ? jit->exitSyncThumb : jit->exitSyncArm);
 	}
 
-	// Constant pool
-	uint32_t* pool = e->ptr;
-	for (f = 0; f < e->nConsts; ++f) {
-		_emit(e, e->consts[f]);
-	}
-	header[2] = (uint32_t) (uintptr_t) pool;
 #ifdef JITDBG
 	dbgTailWords += e->ptr - dbgTail;
 #endif
 	_setCold(e, false);
 
+	if (e->overflow && i > 4) {
+		// Too big (e.g. for the constant pool to stay in reach): try half
+		maxInsns = i / 2;
+		goto retry;
+	}
 	if (e->overflow || !i) {
 		return NULL;
 	}
@@ -2894,16 +3001,19 @@ static void _unchain(struct ARMJit* jit, struct ARMJitBlock* block) {
 	block->incoming = NULL;
 }
 
-static void _chain(struct ARMJit* jit, uint32_t* slot, struct ARMJitBlock* target) {
+static void _chain(struct ARMJit* jit, uint32_t* taggedSlot, struct ARMJitBlock* target) {
 	if (jit->nChainLinks >= JIT_MAX_CHAIN_LINKS) {
 		return;
 	}
+	// Bit 0 of the slot address: r9/r10 are already set for the target
+	bool fast = (uintptr_t) taggedSlot & 1;
+	uint32_t* slot = (uint32_t*) ((uintptr_t) taggedSlot & ~(uintptr_t) 3);
 	struct ARMJitChainLink* link = &jit->chainLinks[jit->nChainLinks++];
 	link->slot = slot;
 	link->original = *slot;
 	link->next = target->incoming;
 	target->incoming = link;
-	*slot = _branchWord(COND_AL, slot, target->entry);
+	*slot = _branchWord(COND_AL, slot, fast ? target->fastEntry : target->entry);
 	_flushCache(jit, slot, 4);
 }
 
