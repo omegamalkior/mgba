@@ -185,6 +185,10 @@ struct ARMJit {
 
 	struct ARMJitStats stats;
 
+	/* Blocks depend on these GBA settings; a change flushes the cache */
+	int idleOptimization;
+	uint32_t idleLoop;
+
 	/* Reused for every block, so compiling does not allocate */
 	struct ARMJitEmitter* emitter;
 	struct ARMJitEmitter* scratch;
@@ -231,9 +235,16 @@ struct ARMJitEmitter {
 	struct {
 		uint32_t* site;
 		uint32_t target;
-		int32_t pcAfter; // < 0: state already synced, exit plainly
+		bool synced; // PC and prefetch are already in the CPU struct
+		int32_t pcAfter; // else: guest PC value to sync, relative to r10
 	} slots[JIT_MAX_SLOTS];
 	unsigned nSlots;
+	/* Event exits that sync an arbitrary guest PC value (native branches) */
+	struct {
+		uint32_t* site;
+		int32_t pcAfter;
+	} exits[JIT_MAX_ARM_INSNS + JIT_MAX_THUMB_INSNS];
+	unsigned nExits;
 	/* Event-check batching: the next segSkip native instructions skip their
 	 * own event check, because a check before them covered them all */
 	unsigned segSkip;
@@ -255,6 +266,7 @@ struct ARMJitEmitter {
 		int writebackReg;
 		int32_t writebackDelta;
 		unsigned rewind; // r6 charges to take back: instructions of the run not executed
+		bool native; // kind 0: branch without the interpreter
 	} deferred[JIT_MAX_ARM_INSNS + JIT_MAX_THUMB_INSNS];
 	unsigned nDeferred;
 	/* Set while classifying instructions on a scratch emitter */
@@ -984,13 +996,13 @@ static void _storeGuestReg(struct ARMJitInsnContext* ctx, unsigned hostReg, unsi
 
 /* Emits a branch that initially leaves the block and is later patched to jump
  * straight into the block for TARGET. */
-static void _emitChainSlot(struct ARMJitInsnContext* ctx, uint32_t target, int32_t pcAfter) {
+static void _emitChainSlot(struct ARMJitInsnContext* ctx, uint32_t target, bool synced, int32_t pcAfter) {
 	struct ARMJitEmitter* e = ctx->e;
 	e->sawOther = true;
 	e->segSkip = 0;
 	_flagsClobber(e);
 	if (e->nSlots >= JIT_MAX_SLOTS) {
-		if (pcAfter < 0) {
+		if (synced) {
 			_b(e, COND_AL, ctx->jit->exitPlain);
 		} else {
 			_addImm(e, R0, R10, pcAfter);
@@ -1000,6 +1012,7 @@ static void _emitChainSlot(struct ARMJitInsnContext* ctx, uint32_t target, int32
 	}
 	e->slots[e->nSlots].site = _bPlaceholder(e, COND_AL);
 	e->slots[e->nSlots].target = target | (ctx->thumb ? 1 : 0);
+	e->slots[e->nSlots].synced = synced;
 	e->slots[e->nSlots].pcAfter = pcAfter;
 	++e->nSlots;
 }
@@ -1028,6 +1041,93 @@ static void _emitIndirectExit(struct ARMJitInsnContext* ctx) {
 	_b(e, COND_NE, jit->exitPlain);
 	_ldr(e, R12, R3, 4);
 	_bx(e, R12);
+}
+
+/* A branch to a fixed TARGET can skip the interpreter when all its handler
+ * would do is move the PC within the mapped region: same region and mirror,
+ * inside the ROM image, and not the idle loop. While mGBA is still looking for
+ * an idle loop, every jump feeds that detection, so the handler stays. */
+static bool _canBranchNatively(const struct ARMJitInsnContext* ctx, uint32_t target) {
+	struct GBA* gba = ctx->gba;
+	uint32_t from = ctx->block->guestAddress;
+	unsigned width = ctx->thumb ? 2 : 4;
+	if (gba->idleOptimization == IDLE_LOOP_DETECT) {
+		return false;
+	}
+	if (gba->idleOptimization >= IDLE_LOOP_REMOVE && target == gba->idleLoop) {
+		return false;
+	}
+	if (target & (width - 1)) {
+		return false;
+	}
+	uint32_t mask;
+	switch (from >> 24) {
+	case GBA_REGION_EWRAM:
+		mask = GBA_SIZE_EWRAM - 1;
+		break;
+	case GBA_REGION_IWRAM:
+		mask = GBA_SIZE_IWRAM - 1;
+		break;
+	case GBA_REGION_ROM0:
+	case GBA_REGION_ROM0_EX:
+	case GBA_REGION_ROM1:
+	case GBA_REGION_ROM1_EX:
+	case GBA_REGION_ROM2:
+	case GBA_REGION_ROM2_EX:
+		if ((target >> 24) != (from >> 24)) {
+			return false;
+		}
+		return (target & (GBA_SIZE_ROM0 - 1)) + 3 * width <= gba->memory.romSize;
+	default:
+		return false;
+	}
+	// RAM: the same mirror, and the prefetch must not wrap around its end
+	if ((target & ~mask) != (from & ~mask)) {
+		return false;
+	}
+	return (target & mask) + 3 * width <= mask + 1;
+}
+
+/* Takes back COUNT instructions' worth of r6 cycles charged up front */
+static void _emitRewind(struct ARMJitEmitter* e, unsigned count) {
+	unsigned bit;
+	for (bit = 0; count >> bit; ++bit) {
+		if (count & (1u << bit)) {
+			_dpReg(e, COND_AL, ALU_SUB, false, R5, R5, R6, SHIFT_LSL, bit);
+		}
+	}
+}
+
+/* Branch to TARGET the way the interpreter's B/BL handlers do, minus the call:
+ * reset the GamePak prefetch tracking, charge this instruction's prefetch plus
+ * the refill of the pipeline (2 + N + S), then check for events and leave
+ * through a chain slot. link != 0 is stored in LR first. */
+static void _emitNativeBranch(struct ARMJitInsnContext* ctx, uint32_t target, uint32_t link) {
+	struct ARMJitEmitter* e = ctx->e;
+	struct GBA* gba = ctx->gba;
+	unsigned width = ctx->thumb ? 2 : 4;
+	int32_t pcAfter = (int32_t) (target + width - ctx->block->guestAddress);
+	if (link) {
+		_loadConst(e, R0, link);
+		_storeGuestReg(ctx, R0, ARM_LR);
+	}
+	_loadConst(e, R12, (uint32_t) (uintptr_t) &gba->memory.lastPrefetchedPc);
+	_dpImm(e, COND_AL, ALU_MOV, false, R0, 0, 0);
+	_str(e, R0, R12, 0);
+	_ldr(e, R0, R4, ctx->thumb ? offsetof(struct ARMCore, memory.activeNonseqCycles16) : offsetof(struct ARMCore, memory.activeNonseqCycles32));
+	_dpReg(e, COND_AL, ALU_ADD, false, R5, R5, R6, SHIFT_LSL, 1);
+	_dpImm(e, COND_AL, ALU_ADD, false, R0, R0, 1);
+	_dpReg(e, COND_AL, ALU_ADD, false, R5, R5, R0, SHIFT_LSL, 0);
+	_flagsClobber(e);
+	_dpReg(e, COND_AL, ALU_CMP, true, 0, R5, R7, SHIFT_LSL, 0);
+	if (e->nExits < sizeof(e->exits) / sizeof(e->exits[0])) {
+		e->exits[e->nExits].site = _bPlaceholder(e, COND_GE);
+		e->exits[e->nExits].pcAfter = pcAfter;
+		++e->nExits;
+	} else {
+		e->overflow = true;
+	}
+	_emitChainSlot(ctx, target, false, pcAfter);
 }
 
 enum {
@@ -1108,7 +1208,7 @@ static void _emitHelperCall(struct ARMJitInsnContext* ctx, unsigned cond, uintpt
 	if (chain == CHAIN_ALWAYS) {
 		_dpReg(e, COND_AL, ALU_CMP, true, 0, R5, R7, SHIFT_LSL, 0);
 		_b(e, COND_GE, jit->exitPlain);
-		_emitChainSlot(ctx, chainTarget, -1);
+		_emitChainSlot(ctx, chainTarget, true, 0);
 	} else if (branchClass) {
 		_emitIndirectExit(ctx);
 	} else {
@@ -1120,7 +1220,7 @@ static void _emitHelperCall(struct ARMJitInsnContext* ctx, unsigned cond, uintpt
 			notTaken = _bPlaceholder(e, COND_EQ);
 			_dpReg(e, COND_AL, ALU_CMP, true, 0, R5, R7, SHIFT_LSL, 0);
 			_b(e, COND_GE, jit->exitPlain);
-			_emitChainSlot(ctx, chainTarget, -1);
+			_emitChainSlot(ctx, chainTarget, true, 0);
 			_patchBranch(notTaken, e->ptr);
 		}
 		// Leave if the handler changed the PC (e.g. an unexpected PC write)
@@ -1794,8 +1894,28 @@ static void _armEmitInstruction(struct ARMJitInsnContext* ctx, uint32_t opcode, 
 	if ((opcode & 0x0E000000) == 0x0A000000) {
 		// B/BL: static target
 		int32_t offset = (int32_t) (opcode << 8) >> 6;
-		target = ctx->block->guestAddress + (uint32_t) _pcValue(ctx) + (uint32_t) offset;
+		uint32_t pcValue = ctx->block->guestAddress + (uint32_t) _pcValue(ctx);
+		target = pcValue + (uint32_t) offset;
 		chain = CHAIN_ALWAYS;
+		unsigned cond = opcode >> 28;
+		if (cond != COND_NV && _canBranchNatively(ctx, target)) {
+			struct ARMJitEmitter* e = ctx->e;
+			uint32_t link = (opcode & 0x01000000) ? pcValue - WORD_SIZE_ARM : 0;
+			if (cond == COND_AL) {
+				_emitNativeBranch(ctx, target, link);
+				*endBlock = true;
+				return;
+			}
+			_flagsNeedHost(e);
+			_flagsToR8(e);
+			uint32_t* skip = _bPlaceholder(e, cond ^ 1);
+			int flags = e->flags;
+			_emitNativeBranch(ctx, target, link);
+			e->flags = flags;
+			_patchBranch(skip, e->ptr);
+			_cyclesAndCheck(ctx);
+			return;
+		}
 	}
 	_emitHelperCall(ctx, opcode >> 28, (uintptr_t) handler, branchClass, chain, target);
 	if (branchClass && (opcode >> 28) == COND_AL) {
@@ -2090,10 +2210,27 @@ static void _thumbEmitInstruction(struct ARMJitInsnContext* ctx, uint16_t opcode
 			e->overflow = true;
 			return;
 		}
+		bool native = _canBranchNatively(ctx, target);
 		_flagsNeedHost(e);
 		_flagsToR8(e); // the taken path leaves the block
+		if (native && target <= ctx->block->guestAddress + ctx->index * 2) {
+			// Backward: most likely a loop, so keep the taken path in line
+			uint32_t* notTaken = _bPlaceholder(e, ((opcode >> 8) & 0xF) ^ 1);
+			int flags = e->flags;
+			unsigned segSkip = e->segSkip;
+			bool sawOther = e->sawOther;
+			_emitRewind(e, segSkip);
+			_emitNativeBranch(ctx, target, 0);
+			e->flags = flags;
+			e->segSkip = segSkip;
+			e->sawOther = sawOther;
+			_patchBranch(notTaken, e->ptr);
+			_nativeCycles(ctx);
+			return;
+		}
 		uint32_t* taken = _bPlaceholder(e, (opcode >> 8) & 0xF);
 		e->deferred[e->nDeferred].rewind = e->segSkip;
+		e->deferred[e->nDeferred].native = native;
 		_nativeCycles(ctx);
 		e->deferred[e->nDeferred].site = taken;
 		e->deferred[e->nDeferred].back = e->ptr;
@@ -2106,12 +2243,19 @@ static void _thumbEmitInstruction(struct ARMJitInsnContext* ctx, uint16_t opcode
 	}
 	int chain = CHAIN_NONE;
 	uint32_t target = 0;
+	uint32_t link = 0;
 	if ((opcode & 0xF800) == 0xE000) {
 		target = pcValue + (uint32_t) ((int32_t) ((uint32_t) (opcode & 0x7FF) << 21) >> 20);
 		chain = CHAIN_ALWAYS;
 	} else if ((opcode & 0xF800) == 0xF800 && prevWasBL1) {
 		target = ctx->bl1Value + ((opcode & 0x7FF) << 1);
 		chain = CHAIN_ALWAYS;
+		link = pcValue - 1;
+	}
+	if (chain == CHAIN_ALWAYS && _canBranchNatively(ctx, target)) {
+		_emitNativeBranch(ctx, target, link);
+		*endBlock = true;
+		return;
 	}
 	_emitHelperCall(ctx, COND_AL, (uintptr_t) handler, branchClass, chain, target);
 	if (branchClass) {
@@ -2154,6 +2298,7 @@ static void _resetEmitter(struct ARMJitEmitter* e) {
 	e->nConsts = 0;
 	e->nStubFixups = 0;
 	e->nSlots = 0;
+	e->nExits = 0;
 	e->nBails = 0;
 	e->nDeferred = 0;
 	e->segSkip = 0;
@@ -2382,7 +2527,7 @@ static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uin
 	if (!endBlock && i) {
 		// Fell off the end of the block: continue with the next block
 		ctx.index = i - 1;
-		_emitChainSlot(&ctx, address + i * (thumb ? 2 : 4), _pcValue(&ctx));
+		_emitChainSlot(&ctx, address + i * (thumb ? 2 : 4), false, _pcValue(&ctx));
 	}
 
 #ifdef JITDBG
@@ -2397,12 +2542,10 @@ static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uin
 		if (e->deferred[f].kind == 0) {
 			// Taken conditional branch. Inside a run, the rest of the run was
 			// charged already; take that back.
-			unsigned rewind = e->deferred[f].rewind;
-			unsigned bit;
-			for (bit = 0; rewind >> bit; ++bit) {
-				if (rewind & (1u << bit)) {
-					_dpReg(e, COND_AL, ALU_SUB, false, R5, R5, R6, SHIFT_LSL, bit);
-				}
+			_emitRewind(e, e->deferred[f].rewind);
+			if (e->deferred[f].native) {
+				_emitNativeBranch(&ctx, e->deferred[f].target, 0);
+				continue;
 			}
 			_emitHelperCall(&ctx, COND_AL, e->deferred[f].handler, false, CHAIN_IF_TAKEN, e->deferred[f].target);
 			_msrFlags(e, R8);
@@ -2438,7 +2581,7 @@ static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uin
 		_str(e, R1, R4, jit->offLastSlot);
 		_loadConst(e, R1, e->slots[f].target);
 		_str(e, R1, R4, jit->offLastSlotTarget);
-		if (e->slots[f].pcAfter < 0) {
+		if (e->slots[f].synced) {
 			_b(e, COND_AL, jit->exitPlain);
 		} else {
 			_addImm(e, R0, R10, e->slots[f].pcAfter);
@@ -2458,6 +2601,12 @@ static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uin
 			_b(e, COND_AL, thumb ? jit->exitSyncThumb : jit->exitSyncArm);
 		}
 		_patchBranch(e->stubFixups[f].site, stubs[insn]);
+	}
+
+	for (f = 0; f < e->nExits; ++f) {
+		_patchBranch(e->exits[f].site, e->ptr);
+		_addImm(e, R0, R10, e->exits[f].pcAfter);
+		_b(e, COND_AL, thumb ? jit->exitSyncThumb : jit->exitSyncArm);
 	}
 
 	// Bails before a run that might reach the next event: step it in the interpreter
@@ -2717,6 +2866,13 @@ static bool _prefetchMatches(const struct ARMCore* cpu, const struct ARMJitBlock
 
 void ARMJitRunLoop(struct ARMCore* cpu) {
 	struct ARMJit* jit = cpu->jit;
+	struct GBA* gba = (struct GBA*) cpu->master;
+	if (jit->idleOptimization != (int) gba->idleOptimization || jit->idleLoop != gba->idleLoop) {
+		// Blocks were translated for the old idle loop settings
+		jit->idleOptimization = gba->idleOptimization;
+		jit->idleLoop = gba->idleLoop;
+		_flush(jit, cpu);
+	}
 	while (cpu->cycles < cpu->nextEvent) {
 		bool thumb = cpu->executionMode == MODE_THUMB;
 		uint32_t address = cpu->gprs[ARM_PC] - (thumb ? WORD_SIZE_THUMB : WORD_SIZE_ARM);
