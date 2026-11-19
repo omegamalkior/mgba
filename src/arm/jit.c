@@ -175,6 +175,11 @@ struct ARMJit {
 
 	struct ARMJitStats stats;
 
+	/* Reused for every block, so compiling does not allocate */
+	struct ARMJitEmitter* emitter;
+	struct ARMJitEmitter* scratch;
+	uint32_t* scratchBuffer;
+
 	/* Indirect branch targets: key = guest address | thumb, value = entry */
 	struct {
 		uint32_t key;
@@ -2045,6 +2050,18 @@ static bool _isJittableRegion(uint32_t address) {
 	}
 }
 
+static void _resetEmitter(struct ARMJitEmitter* e) {
+	e->overflow = false;
+	e->nConsts = 0;
+	e->nStubFixups = 0;
+	e->nSlots = 0;
+	e->nBails = 0;
+	e->nDeferred = 0;
+	e->segSkip = 0;
+	e->sawNative = false;
+	e->sawOther = false;
+}
+
 /* Counts how many instructions from START on translate to native code with a
  * fixed cost (r6 plus at most one cycle), by translating them on a scratch
  * emitter. Such runs need only one event check up front (see _compile). */
@@ -2054,18 +2071,10 @@ static unsigned _scanNative(const struct ARMJitInsnContext* ctx, unsigned start,
 	unsigned n = 0;
 	unsigned j;
 	for (j = start; j < max && n < 64; ++j) {
+		_resetEmitter(scratch);
 		scratch->start = buffer;
 		scratch->ptr = buffer;
 		scratch->end = buffer + words;
-		scratch->overflow = false;
-		scratch->nConsts = 0;
-		scratch->nStubFixups = 0;
-		scratch->nSlots = 0;
-		scratch->nBails = 0;
-		scratch->nDeferred = 0;
-		scratch->segSkip = 0;
-		scratch->sawNative = false;
-		scratch->sawOther = false;
 		c.index = j;
 		bool endBlock = false;
 		if (c.thumb) {
@@ -2134,11 +2143,8 @@ static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uin
 	block->ram = _ramOffset(address) >= 0;
 	block->hostCode = (const uint8_t*) cpu->memory.activeRegion + offset;
 
-	struct ARMJitEmitter* e = malloc(sizeof(*e));
-	if (!e) {
-		return NULL;
-	}
-	memset(e, 0, sizeof(*e));
+	struct ARMJitEmitter* e = jit->emitter;
+	_resetEmitter(e);
 	e->start = jit->codePtr;
 	e->ptr = jit->codePtr;
 	e->end = jit->codePtr + JIT_MAX_BLOCK_WORDS;
@@ -2167,15 +2173,8 @@ static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uin
 	unsigned i;
 	unsigned f;
 	bool endBlock = false;
-	struct ARMJitEmitter* scratch = malloc(sizeof(*scratch));
-	uint32_t* scratchBuffer = malloc(JIT_SCRATCH_WORDS * 4);
-	if (!scratch || !scratchBuffer) {
-		free(scratch);
-		free(scratchBuffer);
-		free(e);
-		return NULL;
-	}
-	memset(scratch, 0, sizeof(*scratch));
+	struct ARMJitEmitter* scratch = jit->scratch;
+	uint32_t* scratchBuffer = jit->scratchBuffer;
 	for (i = 0; i < maxInsns && !endBlock && !e->overflow; ++i) {
 		ctx.index = i;
 		if (!e->segSkip) {
@@ -2222,8 +2221,6 @@ static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uin
 			--e->segSkip;
 		}
 	}
-	free(scratch);
-	free(scratchBuffer);
 	block->length = i;
 	if (!endBlock && i) {
 		// Fell off the end of the block: continue with the next block
@@ -2315,11 +2312,9 @@ static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uin
 #endif
 
 	if (e->overflow || !i) {
-		free(e);
 		return NULL;
 	}
 	if (block->ram && !_registerPages(jit, block, block->length * width + 2 * width)) {
-		free(e);
 #ifdef JITDBG
 		fprintf(stderr, "LINKS FULL\n");
 #endif
@@ -2333,7 +2328,6 @@ static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uin
 	} else {
 		__builtin___clear_cache((char*) e->start, (char*) e->ptr);
 	}
-	free(e);
 
 	unsigned h = _hash(address, thumb);
 	block->nextInHash = jit->hash[h];
@@ -2346,6 +2340,16 @@ static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uin
 /* ---------------------------------------------------------------------------
  * Public interface
  * ------------------------------------------------------------------------- */
+
+static void _freeJit(struct ARMJit* jit) {
+	free(jit->blocks);
+	free(jit->links);
+	free(jit->chainLinks);
+	free(jit->emitter);
+	free(jit->scratch);
+	free(jit->scratchBuffer);
+	free(jit);
+}
 
 bool ARMJitInit(struct ARMCore* cpu, void* execMemory, size_t size, ARMJitCacheFlush flush) {
 	if (cpu->jit) {
@@ -2361,11 +2365,11 @@ bool ARMJitInit(struct ARMCore* cpu, void* execMemory, size_t size, ARMJitCacheF
 	jit->blocks = calloc(JIT_MAX_BLOCKS, sizeof(*jit->blocks));
 	jit->links = calloc(JIT_MAX_LINKS, sizeof(*jit->links));
 	jit->chainLinks = calloc(JIT_MAX_CHAIN_LINKS, sizeof(*jit->chainLinks));
-	if (!jit->blocks || !jit->links || !jit->chainLinks) {
-		free(jit->blocks);
-		free(jit->links);
-		free(jit->chainLinks);
-		free(jit);
+	jit->emitter = malloc(sizeof(*jit->emitter));
+	jit->scratch = malloc(sizeof(*jit->scratch));
+	jit->scratchBuffer = malloc(JIT_SCRATCH_WORDS * 4);
+	if (!jit->blocks || !jit->links || !jit->chainLinks || !jit->emitter || !jit->scratch || !jit->scratchBuffer) {
+		_freeJit(jit);
 		return false;
 	}
 	jit->mem = execMemory;
@@ -2385,10 +2389,7 @@ bool ARMJitInit(struct ARMCore* cpu, void* execMemory, size_t size, ARMJitCacheF
 	jit->offShifterCarry = offsetof(struct ARMCore, shifterCarryOut);
 
 	if (!cpu->master || !_buildTrampolines(jit, (struct GBA*) cpu->master)) {
-		free(jit->blocks);
-		free(jit->links);
-		free(jit->chainLinks);
-		free(jit);
+		_freeJit(jit);
 		return false;
 	}
 	if (flush) {
@@ -2414,10 +2415,7 @@ void ARMJitDeinit(struct ARMCore* cpu) {
 	}
 	cpu->jit = NULL;
 	cpu->jitCodePages = NULL;
-	free(jit->blocks);
-	free(jit->links);
-	free(jit->chainLinks);
-	free(jit);
+	_freeJit(jit);
 }
 
 void ARMJitSetEnabled(struct ARMCore* cpu, bool enabled) {
