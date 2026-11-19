@@ -291,7 +291,7 @@ static const char* _statusText(struct mGUIRunner* runner) {
 	if (runner->core && runner->core->platform(runner->core) == mPLATFORM_GBA) {
 		struct ARMCore* cpu = runner->core->cpu;
 		if (cpu->jit && ARMJitIsEnabled(cpu)) {
-			return "Dynarec: on";
+			return strstr(ctrJitStatus(), "emulator") ? "Dynarec: on (emulator mode)" : "Dynarec: on";
 		}
 		int dynarec = 1;
 		mCoreConfigGetIntValue(&runner->config, "dynarec", &dynarec);

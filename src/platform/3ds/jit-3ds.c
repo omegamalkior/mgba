@@ -58,6 +58,20 @@ __asm__(
 	"	.text\n"
 );
 
+/* Luma3DS's svcInvalidateInstructionCacheRange, which Azahar also implements */
+__asm__(
+	"	.arm\n"
+	"	.section .text.ctrJitInvalidateICacheRange, \"ax\", %progbits\n"
+	"	.align 2\n"
+	"	.global ctrJitInvalidateICacheRange\n"
+	"	.type ctrJitInvalidateICacheRange, %function\n"
+	"ctrJitInvalidateICacheRange:\n"
+	"	svc 0x93\n"
+	"	bx lr\n"
+	"	.text\n"
+);
+
+extern s32 ctrJitInvalidateICacheRange(void* addr, u32 size);
 extern s32 ctrJitKernelFlush(void);
 extern s32 ctrJitCustomBackdoor(s32 (*func)(void));
 extern char __end__[];
@@ -67,9 +81,15 @@ static void* _exec = NULL;
 static size_t _execSize = 0;
 static bool _tried = false;
 static bool _rosalina = false;
+static bool _emulator = false;
 static const char* _status = "Not started";
 
 static void _flush(void* start, size_t size) {
+	if (_emulator) {
+		// Emulators translate guest code themselves; just tell them it changed
+		ctrJitInvalidateICacheRange(start, size);
+		return;
+	}
 	ctrJitFlushRange.start = (uint32_t) start;
 	ctrJitFlushRange.end = (uint32_t) start + size;
 	if (_rosalina) {
@@ -87,6 +107,9 @@ static bool _initMemory(void) {
 
 	s64 version = 0;
 	_rosalina = R_SUCCEEDED(svcGetSystemInfo(&version, 0x10000, 0));
+	s64 emulatorId = 0;
+	// Citra/Azahar answer this with 1 or 2; real hardware returns an error
+	_emulator = R_SUCCEEDED(svcGetSystemInfo(&emulatorId, 0x20000, 0)) && (emulatorId == 1 || emulatorId == 2);
 
 	static const size_t sizes[] = { 0x400000, 0x200000, 0x100000 };
 	size_t i;
@@ -99,6 +122,14 @@ static bool _initMemory(void) {
 	if (!_backing) {
 		_status = "Not enough memory";
 		return false;
+	}
+
+	if (_emulator) {
+		// Emulators don't enforce execute permission, and don't implement the
+		// calls used on hardware, so run the code straight from the buffer
+		_exec = _backing;
+		_status = "Active (emulator)";
+		return true;
 	}
 
 	Handle self;
