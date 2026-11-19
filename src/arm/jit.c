@@ -1072,71 +1072,73 @@ static uint32_t* _buildIndirectExitStub(struct ARMJit* jit, struct ARMJitEmitter
 }
 
 static bool _buildTrampolines(struct ARMJit* jit, struct GBA* gba) {
-	struct ARMJitEmitter e = {0};
-	e.start = jit->mem;
-	e.ptr = jit->mem;
-	e.end = jit->mem + JIT_TRAMPOLINE_WORDS;
+	// The emitter is too big for small stacks (RetroArch's main thread)
+	struct ARMJitEmitter* e = jit->emitter;
+	memset(e, 0, sizeof(*e));
+	e->start = jit->mem;
+	e->ptr = jit->mem;
+	e->end = jit->mem + JIT_TRAMPOLINE_WORDS;
 
 	// enter(cpu, code)
-	uint32_t* litLastPrefetchedPc = e.ptr;
-	_emit(&e, (uint32_t) (uintptr_t) &gba->memory.lastPrefetchedPc);
-	jit->enter = (ARMJitEnter) (uintptr_t) e.ptr;
-	_push(&e, 0x5FF0); // r4-r12, lr
-	_mov(&e, R4, R0);
-	_ldrNear(&e, R11, litLastPrefetchedPc);
+	uint32_t* litLastPrefetchedPc = e->ptr;
+	_emit(e, (uint32_t) (uintptr_t) &gba->memory.lastPrefetchedPc);
+	jit->enter = (ARMJitEnter) (uintptr_t) e->ptr;
+	_push(e, 0x5FF0); // r4-r12, lr
+	_mov(e, R4, R0);
+	_ldrNear(e, R11, litLastPrefetchedPc);
 	// Only blocks in RAM name themselves; anything non-NULL means "in a block"
-	_str(&e, R4, R4, jit->offCurrentBlock);
-	_ldr(&e, R5, R4, jit->offCycles);
-	_ldr(&e, R7, R4, jit->offNextEvent);
-	_ldr(&e, R8, R4, jit->offCpsr);
-	_bx(&e, R1);
+	_str(e, R4, R4, jit->offCurrentBlock);
+	_ldr(e, R5, R4, jit->offCycles);
+	_ldr(e, R7, R4, jit->offNextEvent);
+	_ldr(e, R8, R4, jit->offCpsr);
+	_bx(e, R1);
 
 	// exitPlain: cycles and flags back to the CPU struct, return
-	jit->exitPlain = e.ptr;
-	_str(&e, R5, R4, jit->offCycles);
-	_storeFlags(jit, &e);
-	_pop(&e, 0x9FF0); // r4-r12, pc
+	jit->exitPlain = e->ptr;
+	_str(e, R5, R4, jit->offCycles);
+	_storeFlags(jit, e);
+	_pop(e, 0x9FF0); // r4-r12, pc
 
 	// exitSyncArm: r0 = PC value after the last executed instruction
-	jit->exitSyncArm = e.ptr;
-	_str(&e, R0, R4, offsetof(struct ARMCore, gprs) + 4 * ARM_PC);
-	_dpReg(&e, COND_AL, ALU_SUB, false, R1, R0, R10, SHIFT_LSL, 0);
-	_dpReg(&e, COND_AL, ALU_ADD, false, R1, R1, R9, SHIFT_LSL, 0);
-	_ldr(&e, R2, R1, -4);
-	_str(&e, R2, R4, jit->offPrefetch0);
-	_ldr(&e, R2, R1, 0);
-	_str(&e, R2, R4, jit->offPrefetch1);
-	_b(&e, COND_AL, jit->exitPlain);
+	jit->exitSyncArm = e->ptr;
+	_str(e, R0, R4, offsetof(struct ARMCore, gprs) + 4 * ARM_PC);
+	_dpReg(e, COND_AL, ALU_SUB, false, R1, R0, R10, SHIFT_LSL, 0);
+	_dpReg(e, COND_AL, ALU_ADD, false, R1, R1, R9, SHIFT_LSL, 0);
+	_ldr(e, R2, R1, -4);
+	_str(e, R2, R4, jit->offPrefetch0);
+	_ldr(e, R2, R1, 0);
+	_str(e, R2, R4, jit->offPrefetch1);
+	_b(e, COND_AL, jit->exitPlain);
 
 	// exitSyncThumb
-	jit->exitSyncThumb = e.ptr;
-	_str(&e, R0, R4, offsetof(struct ARMCore, gprs) + 4 * ARM_PC);
-	_dpReg(&e, COND_AL, ALU_SUB, false, R1, R0, R10, SHIFT_LSL, 0);
-	_dpReg(&e, COND_AL, ALU_ADD, false, R1, R1, R9, SHIFT_LSL, 0);
-	_ldrh(&e, R2, R1, -2);
-	_str(&e, R2, R4, jit->offPrefetch0);
-	_ldrh(&e, R2, R1, 0);
-	_str(&e, R2, R4, jit->offPrefetch1);
-	_b(&e, COND_AL, jit->exitPlain);
+	jit->exitSyncThumb = e->ptr;
+	_str(e, R0, R4, offsetof(struct ARMCore, gprs) + 4 * ARM_PC);
+	_dpReg(e, COND_AL, ALU_SUB, false, R1, R0, R10, SHIFT_LSL, 0);
+	_dpReg(e, COND_AL, ALU_ADD, false, R1, R1, R9, SHIFT_LSL, 0);
+	_ldrh(e, R2, R1, -2);
+	_str(e, R2, R4, jit->offPrefetch0);
+	_ldrh(e, R2, R1, 0);
+	_str(e, R2, R4, jit->offPrefetch1);
+	_b(e, COND_AL, jit->exitPlain);
 
 	unsigned thumb;
 	for (thumb = 0; thumb < 2; ++thumb) {
-		jit->helperStub[thumb] = _buildHelperStub(jit, &e, thumb);
+		jit->helperStub[thumb] = _buildHelperStub(jit, e, thumb);
 		unsigned rom, kind;
 		for (rom = 0; rom < 2; ++rom) {
 			for (kind = 0; kind < 8; ++kind) {
-				jit->memStub[thumb][rom][kind] = _buildMemStub(jit, &e, gba, thumb, rom, kind);
+				jit->memStub[thumb][rom][kind] = _buildMemStub(jit, e, gba, thumb, rom, kind);
 			}
-			jit->multiDoneStub[thumb][rom][0] = _buildMultiDoneStub(&e, gba, thumb, rom, false);
-			jit->multiDoneStub[thumb][rom][1] = _buildMultiDoneStub(&e, gba, thumb, rom, true);
+			jit->multiDoneStub[thumb][rom][0] = _buildMultiDoneStub(e, gba, thumb, rom, false);
+			jit->multiDoneStub[thumb][rom][1] = _buildMultiDoneStub(e, gba, thumb, rom, true);
 		}
 	}
-	jit->multiPrepStub[0] = _buildMultiPrepStub(jit, &e, gba, false);
-	jit->multiPrepStub[1] = _buildMultiPrepStub(jit, &e, gba, true);
-	jit->romLiteralStub = _buildRomLiteralStub(&e, gba);
-	jit->indirectExitStub = _buildIndirectExitStub(jit, &e);
+	jit->multiPrepStub[0] = _buildMultiPrepStub(jit, e, gba, false);
+	jit->multiPrepStub[1] = _buildMultiPrepStub(jit, e, gba, true);
+	jit->romLiteralStub = _buildRomLiteralStub(e, gba);
+	jit->indirectExitStub = _buildIndirectExitStub(jit, e);
 
-	return !e.overflow;
+	return !e->overflow;
 }
 
 /* ---------------------------------------------------------------------------
