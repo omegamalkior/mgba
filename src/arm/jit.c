@@ -647,130 +647,199 @@ static void _emitRawAccess(struct ARMJitEmitter* e, bool store, unsigned size, b
 	}
 }
 
-/* Access done: charge the prefetch (r6) like the block would, then return EQ
- * if no event is due, or NE with r12 = 0 if one is. */
+/* ldr rd, [pc, #offset] for a literal word emitted earlier, close by */
+static void _ldrNear(struct ARMJitEmitter* e, unsigned rd, const uint32_t* literal) {
+	int32_t offset = (int32_t) ((const uint8_t*) literal - (const uint8_t*) (e->ptr + 2));
+	_memImm(e, COND_AL, 0x05100000, rd, RPC, offset);
+}
+
+/* Access done: charge the prefetch (r6) like the block would, then return LT
+ * if no event is due, or GE with r12 = 0 if one is. */
 static void _emitMemStubDone(struct ARMJitEmitter* e) {
 	_dpReg(e, COND_AL, ALU_ADD, false, R5, R5, R6, SHIFT_LSL, 0);
 	_dpImm(e, COND_AL, ALU_MOV, false, R12, 0, 0);
 	_dpReg(e, COND_AL, ALU_CMP, true, 0, R5, R7, SHIFT_LSL, 0);
-	_dpImm(e, 0xA, ALU_MOV, false, R3, 0, 1); // movge r3, #1
-	_dpImm(e, 0xB, ALU_MOV, false, R3, 0, 0); // movlt r3, #0
-	_dpImm(e, COND_AL, ALU_CMP, true, 0, R3, 0);
 	_bx(e, RLR);
+}
+
+/* Charges an access that waited r3 cycles and ends the stub. The interpreter
+ * adds the wait, then turns the instruction's sequential fetch into a
+ * non-sequential one (N - S); with r6 = S + 1 that is wait + N + 1 in all. */
+static void _emitMemStubCharge(struct ARMJitEmitter* e, bool thumb) {
+	_ldr(e, R12, R4, thumb ? offsetof(struct ARMCore, memory.activeNonseqCycles16) : offsetof(struct ARMCore, memory.activeNonseqCycles32));
+	_dpReg(e, COND_AL, ALU_ADD, false, R5, R5, R3, SHIFT_LSL, 0);
+	_dpReg(e, COND_AL, ALU_ADD, false, R5, R5, R12, SHIFT_LSL, 0);
+	_dpImm(e, COND_AL, ALU_ADD, false, R5, R5, 1);
+	_dpImm(e, COND_AL, ALU_MOV, false, R12, 0, 0);
+	_dpReg(e, COND_AL, ALU_CMP, true, 0, R5, R7, SHIFT_LSL, 0);
+	_bx(e, RLR);
+}
+
+/* GBAMemoryStall, for code running from ROM with the GamePak prefetch on.
+ * In: r3 = wait, r2 = guest PC value. Charges the access and ends the stub.
+ * Uses r0 and r1 as scratch around a push/pop.
+ *
+ * The interpreter's result is max(wait, stall) - stall - (N16 - S16), on top
+ * of which the access costs N - S and the block's r6. */
+static void _emitMemStubStall(struct ARMJitEmitter* e, bool thumb, const uint32_t* litLastPrefetchedPc) {
+	_push(e, 0x0003); // r0, r1
+	_ldrNear(e, R12, litLastPrefetchedPc);
+	_ldr(e, R12, R12, 0);
+	_dpReg(e, COND_AL, ALU_SUB, false, R12, R12, R2, SHIFT_LSL, 0); // distance to the last prefetch
+	_dpImm(e, COND_AL, ALU_CMP, true, 0, R12, 16);
+	_dpImm(e, 0x2, ALU_MOV, false, R12, 0, 0); // movhs
+	_dpReg(e, COND_AL, ALU_MOV, false, R12, 0, R12, SHIFT_LSR, 1); // loads already made; counts up to 7
+	_ldr(e, R0, R4, offsetof(struct ARMCore, memory.activeSeqCycles16)); // s
+	_dpImm(e, COND_AL, ALU_ADD, false, R1, R0, 1); // stall = s + 1
+	uint32_t* loop = e->ptr;
+	_dpReg(e, COND_AL, ALU_CMP, true, 0, R1, R3, SHIFT_LSL, 0);
+	uint32_t* done = _bPlaceholder(e, COND_GE);
+	_dpImm(e, COND_AL, ALU_CMP, true, 0, R12, 7);
+	_dpReg(e, 0xB, ALU_ADD, false, R1, R1, R0, SHIFT_LSL, 0); // addlt stall, s
+	_dpImm(e, 0xB, ALU_ADD, false, R12, R12, 1); // addlt
+	_b(e, 0xB, loop); // blt
+	_patchBranch(done, e->ptr);
+	_dpReg(e, COND_AL, ALU_ADD, false, R2, R2, R12, SHIFT_LSL, 1);
+	_ldrNear(e, R12, litLastPrefetchedPc);
+	_str(e, R2, R12, 0);
+	_dpReg(e, COND_AL, ALU_CMP, true, 0, R3, R1, SHIFT_LSL, 0);
+	_dpReg(e, 0xC, ALU_SUB, false, R3, R3, R1, SHIFT_LSL, 0); // subgt: wait beyond the stall
+	_dpReg(e, 0xC, ALU_ADD, false, R5, R5, R3, SHIFT_LSL, 0); // addgt
+	if (!thumb) {
+		// (N32 - S32) - (N16 - S16); r0 still holds S16
+		_dpReg(e, COND_AL, ALU_ADD, false, R5, R5, R0, SHIFT_LSL, 0);
+		_ldr(e, R0, R4, offsetof(struct ARMCore, memory.activeNonseqCycles16));
+		_dpReg(e, COND_AL, ALU_SUB, false, R5, R5, R0, SHIFT_LSL, 0);
+		_ldr(e, R0, R4, offsetof(struct ARMCore, memory.activeNonseqCycles32));
+		_dpReg(e, COND_AL, ALU_ADD, false, R5, R5, R0, SHIFT_LSL, 0);
+		_ldr(e, R0, R4, offsetof(struct ARMCore, memory.activeSeqCycles32));
+		_dpReg(e, COND_AL, ALU_SUB, false, R5, R5, R0, SHIFT_LSL, 0);
+	}
+	_pop(e, 0x0003);
+	_emitMemStubDone(e);
 }
 
 /* Fast EWRAM/IWRAM (and, for loads, ROM) access following GBALoad32/16/8 and
  * GBAStore32/16/8 exactly.
  * In: r0 = address, r1 = value (stores), r2 = guest PC value (ROM variant).
- * Out: EQ with the access done, r5 charged (including r6) and r1 = value
- * (loads); NE with r12 = 0: the same, but an event is due; NE with r12 = 1:
+ * Out: LT with the access done, r5 charged (including r6) and r1 = value
+ * (loads); GE with r12 = 0: the same, but an event is due; GE with r12 = 1:
  * nothing changed, the interpreter must handle the instruction.
  * Keeps r0 and r4-r11. */
-static void _buildMemStub(struct ARMJit* jit, struct ARMJitEmitter* e, struct GBA* gba, bool thumb, bool rom, unsigned kind) {
+static uint32_t* _buildMemStub(struct ARMJit* jit, struct ARMJitEmitter* e, struct GBA* gba, bool thumb, bool rom, unsigned kind) {
 	bool store, sign;
 	unsigned size;
 	_memKind(kind, &store, &size, &sign);
-	uint32_t* slow[6] = {0};
+	uint32_t* slow[8] = {0};
 	unsigned nSlow = 0;
+	const char* table = (size == 4) ? gba->memory.waitstatesNonseq32 : gba->memory.waitstatesNonseq16;
 
-	if (rom) {
-		// GBAMemoryStall looks at the PC
-		_str(e, R2, R4, offsetof(struct ARMCore, gprs) + 4 * ARM_PC);
-	}
+	// Addresses the stub needs, right before its code
+	uint32_t* litPages = e->ptr;
+	_emit(e, (uint32_t) (uintptr_t) jit->pages);
+	uint32_t* litWram = e->ptr;
+	_emit(e, (uint32_t) (uintptr_t) gba->memory.wram);
+	uint32_t* litWait = e->ptr;
+	_emit(e, (uint32_t) (uintptr_t) table);
+	uint32_t* litPrefetch = e->ptr;
+	_emit(e, (uint32_t) (uintptr_t) &gba->memory.prefetch);
+	uint32_t* litLastPrefetchedPc = e->ptr;
+	_emit(e, (uint32_t) (uintptr_t) &gba->memory.lastPrefetchedPc);
+	uint32_t* litRomSize = e->ptr;
+	_emit(e, (uint32_t) (uintptr_t) &gba->memory.romSize);
+	uint32_t* litRom = e->ptr;
+	_emit(e, (uint32_t) (uintptr_t) &gba->memory.rom);
+
+	uint32_t* entry = e->ptr;
 	if (!store && size > 1) {
 		_dpImm(e, COND_AL, ALU_TST, true, 0, R0, size - 1);
 		slow[nSlow++] = _bPlaceholder(e, COND_NE);
 	}
-	// r2 = region - 2; EWRAM is 0, IWRAM is 1
-	_dpReg(e, COND_AL, ALU_MOV, false, R2, 0, R0, SHIFT_LSR, 24);
-	_dpImm(e, COND_AL, ALU_SUB, false, R2, R2, 2);
-	_dpImm(e, COND_AL, ALU_CMP, true, 0, R2, 1);
-	uint32_t* notRam = _bPlaceholder(e, 0x8); // HI
-	// r3 = offset into the combined EWRAM+IWRAM buffer
-	_dpImm(e, COND_AL, ALU_CMP, true, 0, R2, 0);
-	_dpReg(e, COND_EQ, ALU_MOV, false, R3, 0, R0, SHIFT_LSL, 14);
-	_dpReg(e, COND_EQ, ALU_MOV, false, R3, 0, R3, SHIFT_LSR, 14);
-	_dpReg(e, COND_NE, ALU_MOV, false, R3, 0, R0, SHIFT_LSL, 17);
-	_dpReg(e, COND_NE, ALU_MOV, false, R3, 0, R3, SHIFT_LSR, 17);
-	_dpImm(e, COND_NE, ALU_ADD, false, R3, R3, ARM_JIT_EWRAM_SIZE);
-	if (store) {
-		if (size > 1) {
-			_dpImm(e, COND_AL, ALU_BIC, false, R3, R3, size - 1);
-		}
-		// Stores near translated code go through the interpreter
-		_ldrLiteral(e, R12, (uint32_t) (uintptr_t) jit->pages);
-		_emit(e, 0xE7D00000 | (R12 << 16) | (R12 << 12) | (ARM_JIT_PAGE_SHIFT << 7) | (SHIFT_LSR << 5) | R3); // ldrb r12, [r12, r3, lsr #PAGE_SHIFT]
-		_dpImm(e, COND_AL, ALU_CMP, true, 0, R12, 0);
-		slow[nSlow++] = _bPlaceholder(e, COND_NE);
-	}
-	_ldrLiteral(e, R12, (uint32_t) (uintptr_t) gba->memory.wram);
-	_emitRawAccess(e, store, size, sign, R1, R12, R3);
+	_dpReg(e, COND_AL, ALU_MOV, false, R3, 0, R0, SHIFT_LSR, 24);
+	_dpImm(e, COND_AL, ALU_CMP, true, 0, R3, GBA_REGION_IWRAM);
+	uint32_t* iwram = _bPlaceholder(e, COND_EQ);
+	_dpImm(e, COND_AL, ALU_CMP, true, 0, R3, GBA_REGION_EWRAM);
+	uint32_t* notRam = _bPlaceholder(e, COND_NE);
 
-	// Wait states: EWRAM uses the non-sequential table entry, IWRAM has none
-	const char* table = (size == 4) ? gba->memory.waitstatesNonseq32 : gba->memory.waitstatesNonseq16;
-	_ldrLiteral(e, R12, (uint32_t) (uintptr_t) &table[GBA_REGION_EWRAM]);
-	_dpImm(e, COND_AL, ALU_CMP, true, 0, R2, 0);
-	_memImm(e, COND_EQ, 0x05500000, R3, R12, 0); // ldrbeq r3, [r12]
-	_dpImm(e, COND_NE, ALU_MOV, false, R3, 0, 0);
-	_dpImm(e, COND_AL, ALU_ADD, false, R3, R3, store ? 1 : 2);
+	unsigned region;
+	uint32_t* charge[2] = {0};
+	for (region = 0; region < 2; ++region) {
+		bool isIwram = region == 1;
+		if (isIwram) {
+			_patchBranch(iwram, e->ptr);
+		}
+		// r3 = offset into the combined EWRAM+IWRAM buffer
+		unsigned bits = isIwram ? 17 : 14;
+		_dpReg(e, COND_AL, ALU_MOV, false, R3, 0, R0, SHIFT_LSL, bits);
+		_dpReg(e, COND_AL, ALU_MOV, false, R3, 0, R3, SHIFT_LSR, bits);
+		if (isIwram) {
+			_dpImm(e, COND_AL, ALU_ADD, false, R3, R3, ARM_JIT_EWRAM_SIZE);
+		}
+		if (store) {
+			if (size > 1) {
+				_dpImm(e, COND_AL, ALU_BIC, false, R3, R3, size - 1);
+			}
+			// Stores near translated code go through the interpreter
+			_ldrNear(e, R12, litPages);
+			_emit(e, 0xE7D00000 | (R12 << 16) | (R12 << 12) | (ARM_JIT_PAGE_SHIFT << 7) | (SHIFT_LSR << 5) | R3); // ldrb r12, [r12, r3, lsr #PAGE_SHIFT]
+			_dpImm(e, COND_AL, ALU_CMP, true, 0, R12, 0);
+			slow[nSlow++] = _bPlaceholder(e, COND_NE);
+		}
+		_ldrNear(e, R12, litWram);
+		_emitRawAccess(e, store, size, sign, R1, R12, R3);
+		// Wait states: EWRAM uses the non-sequential table entry, IWRAM has none
+		if (isIwram) {
+			_dpImm(e, COND_AL, ALU_MOV, false, R3, 0, store ? 1 : 2);
+		} else {
+			_ldrNear(e, R12, litWait);
+			_memImm(e, COND_AL, 0x05500000, R3, R12, GBA_REGION_EWRAM); // ldrb r3, [r12, #EWRAM]
+			_dpImm(e, COND_AL, ALU_ADD, false, R3, R3, store ? 1 : 2);
+			charge[0] = _bPlaceholder(e, COND_AL);
+		}
+	}
+	_patchBranch(charge[0], e->ptr);
 	if (rom) {
 		// Running from ROM: the GamePak prefetch buffer may change the stall
-		_ldrLiteral(e, R12, (uint32_t) (uintptr_t) &gba->memory.prefetch);
+		_ldrNear(e, R12, litPrefetch);
 		_memImm(e, COND_AL, 0x05500000, R12, R12, 0); // ldrb r12, [r12]
 		_dpImm(e, COND_AL, ALU_CMP, true, 0, R12, 0);
 		uint32_t* noStall = _bPlaceholder(e, COND_EQ);
-		_push(e, 0x4007); // r0, r1, r2, lr (keeps the stack 8-byte aligned)
-		_mov(e, R1, R3);
-		_mov(e, R0, R4);
-		_ldr(e, R12, R4, offsetof(struct ARMCore, memory.stall));
-		_blx(e, R12);
-		_mov(e, R3, R0); // the stall's result replaces the wait
-		_pop(e, 0x4007);
+		_emitMemStubStall(e, thumb, litLastPrefetchedPc);
 		_patchBranch(noStall, e->ptr);
 	}
-	_dpReg(e, COND_AL, ALU_ADD, false, R5, R5, R3, SHIFT_LSL, 0);
-	_ldr(e, R3, R4, thumb ? offsetof(struct ARMCore, memory.activeNonseqCycles16) : offsetof(struct ARMCore, memory.activeNonseqCycles32));
-	_dpReg(e, COND_AL, ALU_ADD, false, R5, R5, R3, SHIFT_LSL, 0);
-	_ldr(e, R3, R4, thumb ? offsetof(struct ARMCore, memory.activeSeqCycles16) : offsetof(struct ARMCore, memory.activeSeqCycles32));
-	_dpReg(e, COND_AL, ALU_SUB, false, R5, R5, R3, SHIFT_LSL, 0);
-	_emitMemStubDone(e);
+	_emitMemStubCharge(e, thumb);
 
 	_patchBranch(notRam, e->ptr);
 	if (!store) {
 		/* Cartridge ROM (0x08000000-0x0CFFFFFF), inside the ROM image: same
 		 * value and wait states as GBALoad32/16/8, and no prefetch stall since
 		 * the address is past the ROM base. */
-		_dpImm(e, COND_AL, ALU_SUB, false, R12, R2, GBA_REGION_ROM0 - 2);
+		_dpImm(e, COND_AL, ALU_SUB, false, R12, R3, GBA_REGION_ROM0);
 		_dpImm(e, COND_AL, ALU_CMP, true, 0, R12, GBA_REGION_ROM2 - GBA_REGION_ROM0);
 		slow[nSlow++] = _bPlaceholder(e, 0x8); // HI
+		_ldrNear(e, R12, litWait);
+		_emit(e, 0xE7D00000 | (R12 << 16) | (R12 << 12) | R3); // ldrb r12, [r12, r3]: the region's wait
 		_dpReg(e, COND_AL, ALU_MOV, false, R3, 0, R0, SHIFT_LSL, 7);
 		_dpReg(e, COND_AL, ALU_MOV, false, R3, 0, R3, SHIFT_LSR, 7); // offset in the 32 MiB window
-		_ldrLiteral(e, R12, (uint32_t) (uintptr_t) &gba->memory.romSize);
-		_ldr(e, R12, R12, 0);
-		_dpReg(e, COND_AL, ALU_CMP, true, 0, R3, R12, SHIFT_LSL, 0);
+		_ldrNear(e, R1, litRomSize);
+		_ldr(e, R1, R1, 0);
+		_dpReg(e, COND_AL, ALU_CMP, true, 0, R3, R1, SHIFT_LSL, 0);
 		slow[nSlow++] = _bPlaceholder(e, 0x2); // HS
-		_ldrLiteral(e, R12, (uint32_t) (uintptr_t) &gba->memory.rom);
-		_ldr(e, R12, R12, 0);
-		_emitRawAccess(e, false, size, sign, R1, R12, R3);
-		const char* romTable = (size == 4) ? gba->memory.waitstatesNonseq32 : gba->memory.waitstatesNonseq16;
-		_ldrLiteral(e, R12, (uint32_t) (uintptr_t) romTable);
-		_dpImm(e, COND_AL, ALU_ADD, false, R2, R2, 2); // region
-		_emit(e, 0xE7D00000 | (R12 << 16) | (R3 << 12) | R2); // ldrb r3, [r12, r2]
-		_dpImm(e, COND_AL, ALU_ADD, false, R3, R3, 2);
-		_dpReg(e, COND_AL, ALU_ADD, false, R5, R5, R3, SHIFT_LSL, 0);
-		_ldr(e, R3, R4, thumb ? offsetof(struct ARMCore, memory.activeNonseqCycles16) : offsetof(struct ARMCore, memory.activeNonseqCycles32));
-		_dpReg(e, COND_AL, ALU_ADD, false, R5, R5, R3, SHIFT_LSL, 0);
-		_ldr(e, R3, R4, thumb ? offsetof(struct ARMCore, memory.activeSeqCycles16) : offsetof(struct ARMCore, memory.activeSeqCycles32));
-		_dpReg(e, COND_AL, ALU_SUB, false, R5, R5, R3, SHIFT_LSL, 0);
-		_emitMemStubDone(e);
+		_ldrNear(e, R1, litRom);
+		_ldr(e, R1, R1, 0);
+		_emitRawAccess(e, false, size, sign, R1, R1, R3);
+		_dpImm(e, COND_AL, ALU_ADD, false, R3, R12, 2);
+		_emitMemStubCharge(e, thumb);
 	}
-	// Slow: NE, nothing changed
+	// Slow: GE with r12 = 1, nothing changed
 	unsigned i;
 	for (i = 0; i < nSlow; ++i) {
 		_patchBranch(slow[i], e->ptr);
 	}
-	_dpImm(e, COND_AL, ALU_MOV, true, R12, 0, 1); // NE, r12 = 1: slow
+	_dpImm(e, COND_AL, ALU_MOV, false, R12, 0, 1);
+	_dpImm(e, COND_AL, ALU_CMP, true, 0, R12, 0);
 	_bx(e, RLR);
+	return entry;
 }
 
 static bool _buildTrampolines(struct ARMJit* jit, struct GBA* gba) {
@@ -823,8 +892,7 @@ static bool _buildTrampolines(struct ARMJit* jit, struct GBA* gba) {
 		unsigned rom, kind;
 		for (rom = 0; rom < 2; ++rom) {
 			for (kind = 0; kind < 8; ++kind) {
-				jit->memStub[thumb][rom][kind] = e.ptr;
-				_buildMemStub(jit, &e, gba, thumb, rom, kind);
+				jit->memStub[thumb][rom][kind] = _buildMemStub(jit, &e, gba, thumb, rom, kind);
 			}
 		}
 	}
@@ -1286,7 +1354,7 @@ static void _emitMemoryWithFallback(struct ARMJitInsnContext* ctx, const struct 
 		_addImm(e, R2, R10, _pcValue(ctx));
 	}
 	_bl(e, ctx->jit->memStub[ctx->thumb][rom][_memKindIndex(m->store, m->size, m->sign)]);
-	uint32_t* site = _bPlaceholder(e, COND_NE);
+	uint32_t* site = _bPlaceholder(e, COND_GE);
 	if (!m->store) {
 		_storeGuestReg(ctx, R1, m->guestReg);
 	}
