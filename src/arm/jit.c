@@ -41,12 +41,13 @@
 #endif
 #ifdef JITDBG
 #include <stdio.h>
+#include <stdlib.h>
 static unsigned long long dbgThumbWords[256], dbgThumbCount[256], dbgArmWords[256], dbgArmCount[256], dbgTailWords;
 static void _dbgDump(void) {
 	unsigned i; unsigned long long tw = 0, aw = 0;
 	for (i = 0; i < 256; ++i) { tw += dbgThumbWords[i]; aw += dbgArmWords[i]; }
 	fprintf(stderr, "words: thumb=%llu arm=%llu tail=%llu\n", tw, aw, dbgTailWords);
-	for (i = 0; i < 256; ++i) if (dbgThumbWords[i] * 50 > tw) fprintf(stderr, "  T %02X: %llu words, %llu insns, %.1f avg\n", i, dbgThumbWords[i], dbgThumbCount[i], (double) dbgThumbWords[i] / dbgThumbCount[i]);
+	for (i = 0; i < 256; ++i) if (dbgThumbWords[i] * 100 > tw) fprintf(stderr, "  T %02X: %llu words, %llu insns, %.1f avg\n", i, dbgThumbWords[i], dbgThumbCount[i], (double) dbgThumbWords[i] / dbgThumbCount[i]);
 	for (i = 0; i < 256; ++i) if (dbgArmWords[i] * 50 > aw) fprintf(stderr, "  A %02X: %llu words, %llu insns, %.1f avg\n", i, dbgArmWords[i], dbgArmCount[i], (double) dbgArmWords[i] / dbgArmCount[i]);
 }
 #endif
@@ -2130,6 +2131,57 @@ static unsigned _scanNative(const struct ARMJitInsnContext* ctx, unsigned start,
 	return n;
 }
 
+/* Returns how many instructions the block starting at ADDRESS should hold so
+ * that no stretch of guest code is translated twice: it stops where another
+ * block already starts, and where a branch from inside the block lands (loop
+ * heads and if/else joins become blocks of their own). */
+static unsigned _splitPoint(struct ARMJit* jit, const uint8_t* code, uint32_t address, bool thumb, unsigned max) {
+	unsigned width = thumb ? 2 : 4;
+	unsigned split = max;
+	unsigned n;
+	for (n = 0; n < max; ++n) {
+		if (n && _lookup(jit, address + n * width, thumb)) {
+			return n < split ? n : split;
+		}
+		uint32_t pc = address + n * width + 2 * width;
+		uint32_t target = 0;
+		bool hasTarget = false;
+		bool ends = false;
+		if (thumb) {
+			uint16_t opcode;
+			LOAD_16(opcode, n * 2, code);
+			if ((opcode & 0xF000) == 0xD000 && (opcode & 0x0F00) < 0x0E00) {
+				target = pc + (uint32_t) ((int32_t) (int8_t) opcode << 1);
+				hasTarget = true;
+			} else if ((opcode & 0xF800) == 0xE000) {
+				target = pc + (uint32_t) ((int32_t) ((uint32_t) (opcode & 0x7FF) << 21) >> 20);
+				hasTarget = true;
+				ends = true;
+			} else {
+				ends = _thumbIsBranchClass(opcode);
+			}
+		} else {
+			uint32_t opcode;
+			LOAD_32(opcode, n * 4, code);
+			if ((opcode & 0x0F000000) == 0x0A000000) {
+				target = pc + (uint32_t) ((int32_t) (opcode << 8) >> 6);
+				hasTarget = true;
+			}
+			ends = _armIsBranchClass(opcode) && (opcode >> 28) == COND_AL;
+		}
+		if (hasTarget && target > address && !((target - address) % width)) {
+			unsigned index = (target - address) / width;
+			if (index < split) {
+				split = index;
+			}
+		}
+		if (ends) {
+			break;
+		}
+	}
+	return split;
+}
+
 static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uint32_t address, bool thumb) {
 	struct GBA* gba = (struct GBA*) cpu->master;
 	if (!_isJittableRegion(address) || gba->memory.activeRegion != (int) (address >> 24)) {
@@ -2179,6 +2231,8 @@ static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uin
 	block->thumb = thumb;
 	block->ram = _ramOffset(address) >= 0;
 	block->hostCode = (const uint8_t*) cpu->memory.activeRegion + offset;
+
+	maxInsns = _splitPoint(jit, block->hostCode, address, thumb, maxInsns);
 
 	struct ARMJitEmitter* e = jit->emitter;
 	_resetEmitter(e);
@@ -2415,6 +2469,9 @@ bool ARMJitInit(struct ARMCore* cpu, void* execMemory, size_t size, ARMJitCacheF
 		_freeJit(jit);
 		return false;
 	}
+#ifdef JITDBG
+	atexit(_dbgDump);
+#endif
 	jit->mem = execMemory;
 	jit->memWords = size / 4;
 	jit->flushCache = flush;
