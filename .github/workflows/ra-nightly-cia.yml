@@ -12,8 +12,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {core: mgba, repo: libretro/mgba, mk: "make -f Makefile.libretro platform=ctr", lib: mgba_libretro_ctr.a}
-          - {core: gpsp, repo: libretro/gpsp, mk: "make platform=ctr", lib: gpsp_libretro_ctr.a}
+          - {core: mgba, repo: libretro/mgba, mk: "mkdir -p b && cd b && cmake .. -DCMAKE_TOOLCHAIN_FILE=../src/platform/3ds/CMakeToolchain.txt -DBUILD_LIBRETRO=ON -DLIBRETRO_STATIC=ON -DSKIP_LIBRARY=ON -DBUILD_QT=OFF -DBUILD_SDL=OFF -DCMAKE_BUILD_TYPE=Release && make mgba_libretro", lib: mgba_libretro}
+          - {core: gpsp, repo: libretro/gpsp, mk: "make platform=ctr", lib: gpsp_libretro}
     steps:
       - name: Sources (latest master = nightly)
         run: |
@@ -24,11 +24,12 @@ jobs:
           cat info.txt
       - name: Build core
         run: |
-          cd core && ${{ matrix.mk }} -j4 >../core.log 2>&1 || (tail -40 ../core.log; exit 1)
-          ls -la *.a
+          export CTRULIB=$DEVKITPRO/libctru
+          cd core && ( ${{ matrix.mk }} -j4 ) >../core.log 2>&1 || (tail -40 ../core.log; exit 1)
+          cd $GITHUB_WORKSPACE && find core -name '${{ matrix.lib }}*.a' | tee -a core.log
       - name: Build RetroArch CIA
         run: |
-          cp core/${{ matrix.lib }} ra/libretro_ctr.a
+          cp "$(find core -name '${{ matrix.lib }}*.a' | head -1)" ra/libretro_ctr.a
           cd ra && chmod +x pkg/ctr/tools/*-linux || true
           make -f Makefile.ctr LIBRETRO=${{ matrix.core }} -j4 >../ra.log 2>&1 || (tail -40 ../ra.log; exit 1)
           ls -la retroarch_3ds.cia
