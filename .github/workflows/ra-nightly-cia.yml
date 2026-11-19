@@ -33,12 +33,19 @@ jobs:
           make -f Makefile.ctr LIBRETRO=${{ matrix.core }} -j4 >../ra.log 2>&1 || (tail -40 ../ra.log; exit 1)
           ls -la retroarch_3ds.cia
           mkdir -p ../out && cp retroarch_3ds.cia ../out/${{ matrix.core }}_libretro.cia && cp ../info.txt ../out/${{ matrix.core }}_info.txt
+      - name: Keep logs
+        if: always()
+        run: |
+          mkdir -p out; for f in core.log ra.log info.txt; do [ -f $f ] && tail -150 $f > out/${{ matrix.core }}_$f || true; done
+          ls core >> out/${{ matrix.core }}_files.txt 2>&1 || true
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: ${{ matrix.core }}
           path: out/
   publish:
     needs: build
+    if: always()
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
