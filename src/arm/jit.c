@@ -560,11 +560,21 @@ static void _storeFlags(struct ARMJit* jit, struct ARMJitEmitter* e) {
  * emulator, and a cache that overflows means recompiling everything.
  * ------------------------------------------------------------------------- */
 
+/* ldr rd, [pc, #offset] for a literal word emitted earlier, close by */
+static void _ldrNear(struct ARMJitEmitter* e, unsigned rd, const uint32_t* literal) {
+	int32_t offset = (int32_t) ((const uint8_t*) literal - (const uint8_t*) (e->ptr + 2));
+	_memImm(e, COND_AL, 0x05100000, rd, RPC, offset);
+}
+
 /* Interpreter fallback for one instruction.
- * In: r0 = guest PC value for the instruction, r2 = handler. Calls
- * handler(cpu, opcode) with the CPU state synced, reloads the state, and
- * returns with EQ to continue the block or NE to leave it. */
-static void _buildHelperStub(struct ARMJit* jit, struct ARMJitEmitter* e, bool thumb) {
+ * In: r0 = guest PC value for the instruction. Calls the interpreter's handler
+ * for the opcode there with the CPU state synced, reloads the state, and
+ * returns with EQ to continue the block, or NE if the handler changed the PC
+ * or the block has to be left. */
+static uint32_t* _buildHelperStub(struct ARMJit* jit, struct ARMJitEmitter* e, bool thumb) {
+	uint32_t* litTable = e->ptr;
+	_emit(e, thumb ? (uint32_t) (uintptr_t) _thumbTable : (uint32_t) (uintptr_t) _armTable);
+	uint32_t* entry = e->ptr;
 	_push(e, 0x4001); // r0, lr
 	_str(e, R5, R4, jit->offCycles);
 	_str(e, R0, R4, offsetof(struct ARMCore, gprs) + 4 * ARM_PC);
@@ -584,6 +594,18 @@ static void _buildHelperStub(struct ARMJit* jit, struct ARMJitEmitter* e, bool t
 		_ldr(e, R1, R1, -8);
 	}
 	_storeFlags(jit, e);
+	// The same table lookup the interpreter does
+	if (thumb) {
+		_dpReg(e, COND_AL, ALU_MOV, false, R12, 0, R1, SHIFT_LSR, 6);
+	} else {
+		_dpReg(e, COND_AL, ALU_MOV, false, R12, 0, R1, SHIFT_LSR, 16);
+		_dpImm(e, COND_AL, ALU_AND, false, R12, R12, 0xFF0);
+		_dpReg(e, COND_AL, ALU_MOV, false, R2, 0, R1, SHIFT_LSR, 4);
+		_dpImm(e, COND_AL, ALU_AND, false, R2, R2, 0xF);
+		_dpReg(e, COND_AL, ALU_ORR, false, R12, R12, R2, SHIFT_LSL, 0);
+	}
+	_ldrNear(e, R2, litTable);
+	_emit(e, 0xE7900100 | (R2 << 16) | (R2 << 12) | R12); // ldr r2, [r2, r12, lsl #2]
 	_mov(e, R0, R4);
 	_blx(e, R2);
 	_ldr(e, R5, R4, jit->offCycles);
@@ -598,6 +620,7 @@ static void _buildHelperStub(struct ARMJit* jit, struct ARMJitEmitter* e, bool t
 	_memImm(e, COND_EQ, 0x05100000, R1, R4, jit->offExitRequest); // ldreq r1, [r4, #exitRequest]
 	_dpImm(e, COND_EQ, ALU_CMP, true, 0, R1, 0);
 	_bx(e, RLR);
+	return entry;
 }
 
 /* kind: 0-2 = store 8/16/32, 3 = load 32, 4 = load u16, 5 = load s16,
@@ -648,12 +671,6 @@ static void _emitRawAccess(struct ARMJitEmitter* e, bool store, unsigned size, b
 		_emit(e, (sign ? 0xE19000D0 : 0xE7D00000) | (rn << 16) | (rt << 12) | rm); // ldrsb / ldrb
 		break;
 	}
-}
-
-/* ldr rd, [pc, #offset] for a literal word emitted earlier, close by */
-static void _ldrNear(struct ARMJitEmitter* e, unsigned rd, const uint32_t* literal) {
-	int32_t offset = (int32_t) ((const uint8_t*) literal - (const uint8_t*) (e->ptr + 2));
-	_memImm(e, COND_AL, 0x05100000, rd, RPC, offset);
 }
 
 /* Access done: charge the prefetch (r6) like the block would, then return LT
@@ -1013,8 +1030,7 @@ static bool _buildTrampolines(struct ARMJit* jit, struct GBA* gba) {
 
 	unsigned thumb;
 	for (thumb = 0; thumb < 2; ++thumb) {
-		jit->helperStub[thumb] = e.ptr;
-		_buildHelperStub(jit, &e, thumb);
+		jit->helperStub[thumb] = _buildHelperStub(jit, &e, thumb);
 		unsigned rom, kind;
 		for (rom = 0; rom < 2; ++rom) {
 			for (kind = 0; kind < 8; ++kind) {
@@ -1374,77 +1390,22 @@ static void _emitHelperCall(struct ARMJitInsnContext* ctx, unsigned cond, uintpt
 	// The handler gets the flags from r8 and r8 is reloaded after it
 	e->flags = FLAGS_R8;
 
-	if (chain == CHAIN_NONE && !branchClass) {
-		// Common case: one call into the shared stub
-		_addImm(e, R0, R10, pc);
-		_loadConst(e, R2, (uint32_t) handler);
-		_bl(e, jit->helperStub[ctx->thumb]);
-		_b(e, COND_NE, jit->exitPlain);
-		if (skip) {
-			uint32_t* join = _bPlaceholder(e, COND_AL);
-			_patchBranch(skip, e->ptr);
-			_dpReg(e, COND_AL, ALU_ADD, false, R5, R5, R6, SHIFT_LSL, 0);
-			_patchBranch(join, e->ptr);
-		}
-		_eventCheckOnly(ctx);
-		return;
-	}
-
-	// Sync state the handler may look at
-	_str(e, R5, R4, jit->offCycles);
-	_storeFlags(jit, e);
 	_addImm(e, R0, R10, pc);
-	_str(e, R0, R4, offsetof(struct ARMCore, gprs) + 4 * ARM_PC);
-	if (ctx->thumb) {
-		_ldrh(e, R0, R9, pc - 2);
-		_str(e, R0, R4, jit->offPrefetch0);
-		_ldrh(e, R0, R9, pc);
-		_str(e, R0, R4, jit->offPrefetch1);
-		_ldrh(e, R1, R9, pc - 4);
-	} else {
-		_ldr(e, R0, R9, pc - 4);
-		_str(e, R0, R4, jit->offPrefetch0);
-		_ldr(e, R0, R9, pc);
-		_str(e, R0, R4, jit->offPrefetch1);
-		_ldr(e, R1, R9, pc - 8);
-	}
-	_mov(e, R0, R4);
-	_loadConst(e, R2, (uint32_t) handler);
-	_blx(e, R2);
-
-	// Reload state the handler may have changed
-	_ldr(e, R5, R4, jit->offCycles);
-	_ldr(e, R7, R4, jit->offNextEvent);
-	_ldr(e, R8, R4, jit->offCpsr);
-	_ldr(e, R6, R4, ctx->thumb ? jit->offSeq16 : jit->offSeq32);
-	_dpImm(e, COND_AL, ALU_ADD, false, R6, R6, 1);
-
+	_bl(e, jit->helperStub[ctx->thumb]);
 	if (chain == CHAIN_ALWAYS) {
 		_dpReg(e, COND_AL, ALU_CMP, true, 0, R5, R7, SHIFT_LSL, 0);
 		_b(e, COND_GE, jit->exitPlain);
 		_emitChainSlot(ctx, chainTarget, true, 0);
 	} else if (branchClass) {
 		_emitIndirectExit(ctx);
+	} else if (chain == CHAIN_IF_TAKEN) {
+		// The stub returns NE when the handler changed the PC: branch taken
+		uint32_t* notTaken = _bPlaceholder(e, COND_EQ);
+		_dpReg(e, COND_AL, ALU_CMP, true, 0, R5, R7, SHIFT_LSL, 0);
+		_b(e, COND_GE, jit->exitPlain);
+		_emitChainSlot(ctx, chainTarget, true, 0);
+		_patchBranch(notTaken, e->ptr);
 	} else {
-		uint32_t* notTaken = NULL;
-		if (chain == CHAIN_IF_TAKEN) {
-			_ldr(e, R0, R4, offsetof(struct ARMCore, gprs) + 4 * ARM_PC);
-			_addImm(e, R1, R10, pc);
-			_dpReg(e, COND_AL, ALU_CMP, true, 0, R0, R1, SHIFT_LSL, 0);
-			notTaken = _bPlaceholder(e, COND_EQ);
-			_dpReg(e, COND_AL, ALU_CMP, true, 0, R5, R7, SHIFT_LSL, 0);
-			_b(e, COND_GE, jit->exitPlain);
-			_emitChainSlot(ctx, chainTarget, true, 0);
-			_patchBranch(notTaken, e->ptr);
-		}
-		// Leave if the handler changed the PC (e.g. an unexpected PC write)
-		_ldr(e, R0, R4, offsetof(struct ARMCore, gprs) + 4 * ARM_PC);
-		_addImm(e, R1, R10, pc);
-		_dpReg(e, COND_AL, ALU_CMP, true, 0, R0, R1, SHIFT_LSL, 0);
-		_b(e, COND_NE, jit->exitPlain);
-		// Leave if this block (or the whole cache) was invalidated by the handler
-		_ldr(e, R0, R4, jit->offExitRequest);
-		_dpImm(e, COND_AL, ALU_CMP, true, 0, R0, 0);
 		_b(e, COND_NE, jit->exitPlain);
 	}
 
