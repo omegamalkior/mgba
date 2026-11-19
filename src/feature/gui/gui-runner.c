@@ -583,6 +583,10 @@ void mGUIRun(struct mGUIRunner* runner, const char* path) {
 					}
 					if (drawFps) {
 						GUIFontPrintf(runner->params.font, 0, GUIFontHeight(runner->params.font), GUI_ALIGN_LEFT, 0x7FFFFFFF, "%.2f fps", runner->fps);
+						const char* status = runner->statusText ? runner->statusText(runner) : NULL;
+						if (status) {
+							GUIFontPrint(runner->params.font, 0, GUIFontHeight(runner->params.font) * 2, GUI_ALIGN_LEFT, 0x7FFFFFFF, status);
+						}
 					}
 					if (showOSD) {
 						unsigned origin = runner->params.width - GUIFontHeight(runner->params.font) / 2;
