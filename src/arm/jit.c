@@ -215,8 +215,9 @@ struct ARMJitEmitter {
 		uint32_t* site; // branch to patch to the out-of-line code
 		uint32_t* back; // where to continue in the block
 		unsigned index;
-		int kind; // 1 = memory slow path/event
+		int kind; // 0 = taken Thumb conditional branch, 1 = memory slow path/event
 		uintptr_t handler;
+		uint32_t target;
 		bool store;
 		unsigned guestReg;
 		int writebackReg;
@@ -1978,7 +1979,23 @@ static void _thumbEmitInstruction(struct ARMJitInsnContext* ctx, uint16_t opcode
 		// Conditional branch: the handler checks the condition itself; when the
 		// PC changed the branch was taken and we leave through a chain slot.
 		uint32_t target = pcValue + (uint32_t) ((int32_t) (int8_t) opcode << 1);
-		_emitHelperCall(ctx, COND_AL, (uintptr_t) handler, false, CHAIN_IF_TAKEN, target);
+		// Not taken (the common case in loops' exits and checks): the
+		// interpreter only charges the prefetch, 1 + S cycles, which is r6
+		struct ARMJitEmitter* e = ctx->e;
+		if (e->nDeferred >= sizeof(e->deferred) / sizeof(e->deferred[0])) {
+			e->overflow = true;
+			return;
+		}
+		_msrFlags(e, R8);
+		uint32_t* taken = _bPlaceholder(e, (opcode >> 8) & 0xF);
+		_nativeCycles(ctx);
+		e->deferred[e->nDeferred].site = taken;
+		e->deferred[e->nDeferred].back = e->ptr;
+		e->deferred[e->nDeferred].index = ctx->index;
+		e->deferred[e->nDeferred].kind = 0;
+		e->deferred[e->nDeferred].handler = (uintptr_t) handler;
+		e->deferred[e->nDeferred].target = target;
+		++e->nDeferred;
 		return;
 	}
 	int chain = CHAIN_NONE;
@@ -2193,6 +2210,12 @@ static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uin
 	for (f = 0; f < e->nDeferred && !e->overflow; ++f) {
 		ctx.index = e->deferred[f].index;
 		_patchBranch(e->deferred[f].site, e->ptr);
+		if (e->deferred[f].kind == 0) {
+			// Taken conditional branch
+			_emitHelperCall(&ctx, COND_AL, e->deferred[f].handler, false, CHAIN_IF_TAKEN, e->deferred[f].target);
+			_b(e, COND_AL, e->deferred[f].back);
+			continue;
+		}
 		// Memory access: r12 = 0 means done but an event is due, 1 means slow
 		_dpImm(e, COND_AL, ALU_CMP, true, 0, R12, 0);
 		uint32_t* slow = _bPlaceholder(e, COND_NE);
