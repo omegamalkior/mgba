@@ -12,7 +12,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {core: mgba, repo: libretro/mgba, mk: "mkdir -p b && cd b && cmake .. -DCMAKE_TOOLCHAIN_FILE=../src/platform/3ds/CMakeToolchain.txt -DBUILD_LIBRETRO=ON -DLIBRETRO_STATIC=ON -DSKIP_LIBRARY=ON -DBUILD_QT=OFF -DBUILD_SDL=OFF -DCMAKE_BUILD_TYPE=Release && make mgba_libretro", lib: mgba_libretro}
+          - {core: mgba, repo: libretro/mgba, mk: "mkdir -p b && cd b && cmake .. -DCMAKE_TOOLCHAIN_FILE=../src/platform/3ds/CMakeToolchain.txt -DBUILD_LIBRETRO=ON -DLIBRETRO_STATIC=ON -DSKIP_LIBRARY=ON -DBUILD_QT=OFF -DBUILD_SDL=OFF -DUSE_ZLIB=OFF -DUSE_MINIZIP=OFF -DUSE_PNG=OFF -DUSE_LIBZIP=OFF -DUSE_SQLITE3=OFF -DUSE_ELF=OFF -DUSE_LZMA=OFF -DCMAKE_BUILD_TYPE=Release && make mgba_libretro", lib: mgba_libretro}
           - {core: gpsp, repo: libretro/gpsp, mk: "make platform=ctr", lib: gpsp_libretro}
     steps:
       - name: Sources (latest master = nightly)
