@@ -746,7 +746,7 @@ static void _memReg(struct ARMJitEmitter* e, uint32_t base, unsigned rt, unsigne
 
 /* Address in R0. On entry nothing else is live. Emits the fast path and its
  * event check, and returns the branch site that must lead to the slow path. */
-static uint32_t* _emitFastRam(struct ARMJitInsnContext* ctx, const struct ARMJitFastMem* m, uint32_t** doneSite) {
+static uint32_t* _emitFastRam(struct ARMJitInsnContext* ctx, const struct ARMJitFastMem* m, uint32_t** doneSite, uint32_t** romDoneSite) {
 	struct ARMJitEmitter* e = ctx->e;
 	struct GBA* gba = ctx->gba;
 	uint32_t* slowA;
@@ -754,14 +754,14 @@ static uint32_t* _emitFastRam(struct ARMJitInsnContext* ctx, const struct ARMJit
 	uint32_t* slowC = NULL;
 
 	// r2 = region - 2; only EWRAM (0) and IWRAM (1) are handled here
-	_dpReg(e, COND_AL, ALU_MOV, false, R2, 0, R0, SHIFT_LSR, 24);
-	_dpImm(e, COND_AL, ALU_SUB, false, R2, R2, 2);
-	_dpImm(e, COND_AL, ALU_CMP, true, 0, R2, 1);
-	slowA = _bPlaceholder(e, 0x8); // HI
 	if (!m->store && m->size > 1) {
 		_dpImm(e, COND_AL, ALU_TST, true, 0, R0, m->size - 1);
 		slowB = _bPlaceholder(e, COND_NE);
 	}
+	_dpReg(e, COND_AL, ALU_MOV, false, R2, 0, R0, SHIFT_LSR, 24);
+	_dpImm(e, COND_AL, ALU_SUB, false, R2, R2, 2);
+	_dpImm(e, COND_AL, ALU_CMP, true, 0, R2, 1);
+	slowA = _bPlaceholder(e, 0x8); // HI: not RAM (loads try the ROM path)
 	// r3 = offset into the combined EWRAM+IWRAM buffer
 	_dpImm(e, COND_AL, ALU_CMP, true, 0, R2, 0);
 	_dpReg(e, COND_EQ, ALU_MOV, false, R3, 0, R0, SHIFT_LSL, 14);
@@ -855,10 +855,72 @@ static uint32_t* _emitFastRam(struct ARMJitInsnContext* ctx, const struct ARMJit
 	_cyclesAndCheck(ctx);
 	*doneSite = _bPlaceholder(e, COND_AL);
 
+	uint32_t* romDone = NULL;
+	uint32_t* slowD = NULL;
+	uint32_t* slowE = NULL;
+	if (!m->store) {
+		/* Cartridge ROM (0x08000000-0x0CFFFFFF), inside the ROM image: same
+		 * value and wait states as GBALoad32/16/8, and no prefetch stall since
+		 * the address is past the ROM base. */
+		_patchBranch(slowA, e->ptr);
+		slowA = NULL;
+		_dpImm(e, COND_AL, ALU_SUB, false, R12, R2, GBA_REGION_ROM0 - 2);
+		_dpImm(e, COND_AL, ALU_CMP, true, 0, R12, GBA_REGION_ROM2 - GBA_REGION_ROM0);
+		slowD = _bPlaceholder(e, 0x8); // HI
+		_dpReg(e, COND_AL, ALU_MOV, false, R3, 0, R0, SHIFT_LSL, 7);
+		_dpReg(e, COND_AL, ALU_MOV, false, R3, 0, R3, SHIFT_LSR, 7); // offset in the 32 MiB window
+		_loadConst(e, R12, (uint32_t) (uintptr_t) &gba->memory.romSize);
+		_ldr(e, R12, R12, 0);
+		_dpReg(e, COND_AL, ALU_CMP, true, 0, R3, R12, SHIFT_LSL, 0);
+		slowE = _bPlaceholder(e, 0x2); // HS
+		_loadConst(e, R12, (uint32_t) (uintptr_t) &gba->memory.rom);
+		_ldr(e, R12, R12, 0);
+		switch (m->size) {
+		case 4:
+			_memReg(e, 0x07900000, R1, R12, R3, SHIFT_LSL, 0);
+			break;
+		case 2:
+			_emit(e, (m->sign ? 0xE19000F0 : 0xE19000B0) | (R12 << 16) | (R1 << 12) | R3);
+			break;
+		default:
+			if (m->sign) {
+				_emit(e, 0xE19000D0 | (R12 << 16) | (R1 << 12) | R3);
+			} else {
+				_memReg(e, 0x07D00000, R1, R12, R3, SHIFT_LSL, 0);
+			}
+			break;
+		}
+		_storeGuestReg(ctx, R1, m->guestReg);
+		if (m->writebackReg >= 0) {
+			_addImm(e, R0, R0, m->writebackDelta);
+			_storeGuestReg(ctx, R0, m->writebackReg);
+		}
+		const char* romTable = (m->size == 4) ? gba->memory.waitstatesNonseq32 : gba->memory.waitstatesNonseq16;
+		_loadConst(e, R12, (uint32_t) (uintptr_t) romTable);
+		_dpImm(e, COND_AL, ALU_ADD, false, R2, R2, 2); // region
+		_memReg(e, 0x07D00000, R0, R12, R2, SHIFT_LSL, 0); // ldrb r0, [table, region]
+		_dpImm(e, COND_AL, ALU_ADD, false, R0, R0, 2);
+		_dpReg(e, COND_AL, ALU_ADD, false, R5, R5, R0, SHIFT_LSL, 0);
+		if (ctx->thumb) {
+			_ldr(e, R0, R4, offsetof(struct ARMCore, memory.activeNonseqCycles16));
+			_ldr(e, R1, R4, offsetof(struct ARMCore, memory.activeSeqCycles16));
+		} else {
+			_ldr(e, R0, R4, offsetof(struct ARMCore, memory.activeNonseqCycles32));
+			_ldr(e, R1, R4, offsetof(struct ARMCore, memory.activeSeqCycles32));
+		}
+		_dpReg(e, COND_AL, ALU_ADD, false, R5, R5, R0, SHIFT_LSL, 0);
+		_dpReg(e, COND_AL, ALU_SUB, false, R5, R5, R1, SHIFT_LSL, 0);
+		_cyclesAndCheck(ctx);
+		romDone = _bPlaceholder(e, COND_AL);
+	}
+
 	uint32_t* slowStart = e->ptr;
 	_patchBranch(slowA, slowStart);
+	_patchBranch(slowD, slowStart);
+	_patchBranch(slowE, slowStart);
 	_patchBranch(slowB, slowStart);
 	_patchBranch(slowC, slowStart);
+	*romDoneSite = romDone;
 	return slowStart;
 }
 
@@ -866,9 +928,11 @@ static uint32_t* _emitFastRam(struct ARMJitInsnContext* ctx, const struct ARMJit
  * address is computed by ADDRESS into R0. */
 static void _emitMemoryWithFallback(struct ARMJitInsnContext* ctx, const struct ARMJitFastMem* m, uintptr_t handler) {
 	uint32_t* done = NULL;
-	_emitFastRam(ctx, m, &done);
+	uint32_t* romDone = NULL;
+	_emitFastRam(ctx, m, &done, &romDone);
 	_emitHelperCall(ctx, COND_AL, handler, false, CHAIN_NONE, 0);
 	_patchBranch(done, ctx->e->ptr);
+	_patchBranch(romDone, ctx->e->ptr);
 }
 
 /* Thumb PC-relative load from ROM: the value is a constant */
