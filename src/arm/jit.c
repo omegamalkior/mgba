@@ -59,6 +59,8 @@
 #define JIT_MAX_CONSTS 256
 #define JIT_MAX_BLOCK_WORDS 0x2000
 #define JIT_TRAMPOLINE_WORDS 4096
+#define JIT_SCRATCH_WORDS 1024
+#define JIT_STEP_LIMIT 64
 #define JIT_MAX_CHAIN_LINKS 0x8000
 #define JIT_MAX_SLOTS 64
 #define JIT_FAST_BITS 10
@@ -145,6 +147,7 @@ struct ARMJit {
 	uint32_t* exitPlain;
 	uint32_t* exitSyncArm;
 	uint32_t* exitSyncThumb;
+	unsigned stepping; // interpret this many steps (at least one) after a bail
 	/* Shared out-of-line code, so blocks stay small (see _buildStubs) */
 	uint32_t* helperStub[2]; // [thumb]
 	uint32_t* memStub[2][2][8]; // [thumb][running from ROM][kind]
@@ -199,6 +202,14 @@ struct ARMJitEmitter {
 		int32_t pcAfter; // < 0: state already synced, exit plainly
 	} slots[JIT_MAX_SLOTS];
 	unsigned nSlots;
+	/* Event-check batching: the next segSkip native instructions skip their
+	 * own event check, because a check before them covered them all */
+	unsigned segSkip;
+	struct {
+		uint32_t* site;
+		int32_t pcBefore;
+	} bails[JIT_MAX_ARM_INSNS + JIT_MAX_THUMB_INSNS];
+	unsigned nBails;
 	/* Out-of-line pieces emitted after the block body */
 	struct {
 		uint32_t* site; // branch to patch to the out-of-line code
@@ -212,6 +223,9 @@ struct ARMJitEmitter {
 		int32_t writebackDelta;
 	} deferred[JIT_MAX_ARM_INSNS + JIT_MAX_THUMB_INSNS];
 	unsigned nDeferred;
+	/* Set while classifying instructions on a scratch emitter */
+	bool sawNative;
+	bool sawOther;
 };
 
 /* ---------------------------------------------------------------------------
@@ -765,6 +779,7 @@ static void _flush(struct ARMJit* jit, struct ARMCore* cpu) {
 		cpu->jitExitRequest = 1;
 	}
 	cpu->jitLastSlot = NULL;
+	jit->stepping = 0;
 	++jit->stats.flushes;
 }
 
@@ -825,6 +840,8 @@ static int32_t _pcValue(const struct ARMJitInsnContext* ctx) {
 
 static void _cyclesAndCheck(struct ARMJitInsnContext* ctx) {
 	struct ARMJitEmitter* e = ctx->e;
+	e->sawOther = true;
+	e->segSkip = 0;
 	_dpReg(e, COND_AL, ALU_ADD, false, R5, R5, R6, SHIFT_LSL, 0);
 	_dpReg(e, COND_AL, ALU_CMP, true, 0, R5, R7, SHIFT_LSL, 0);
 	if (e->nStubFixups < sizeof(e->stubFixups) / sizeof(e->stubFixups[0])) {
@@ -838,6 +855,8 @@ static void _cyclesAndCheck(struct ARMJitInsnContext* ctx) {
 
 static void _eventCheckOnly(struct ARMJitInsnContext* ctx) {
 	struct ARMJitEmitter* e = ctx->e;
+	e->sawOther = true;
+	e->segSkip = 0;
 	_dpReg(e, COND_AL, ALU_CMP, true, 0, R5, R7, SHIFT_LSL, 0);
 	if (e->nStubFixups < sizeof(e->stubFixups) / sizeof(e->stubFixups[0])) {
 		e->stubFixups[e->nStubFixups].site = _bPlaceholder(e, COND_GE);
@@ -846,6 +865,20 @@ static void _eventCheckOnly(struct ARMJitInsnContext* ctx) {
 	} else {
 		e->overflow = true;
 	}
+}
+
+/* End of a native instruction whose cost is r6 plus at most one extra cycle
+ * (already added). Inside a checked segment the event check is skipped. */
+static void _nativeCycles(struct ARMJitInsnContext* ctx) {
+	struct ARMJitEmitter* e = ctx->e;
+	if (e->segSkip) {
+		_dpReg(e, COND_AL, ALU_ADD, false, R5, R5, R6, SHIFT_LSL, 0);
+		e->sawNative = true;
+		return;
+	}
+	_cyclesAndCheck(ctx);
+	e->sawOther = false;
+	e->sawNative = true;
 }
 
 static void _loadGuestReg(struct ARMJitInsnContext* ctx, unsigned hostReg, unsigned guestReg, int32_t pcExtra) {
@@ -864,6 +897,8 @@ static void _storeGuestReg(struct ARMJitInsnContext* ctx, unsigned hostReg, unsi
  * straight into the block for TARGET. */
 static void _emitChainSlot(struct ARMJitInsnContext* ctx, uint32_t target, int32_t pcAfter) {
 	struct ARMJitEmitter* e = ctx->e;
+	e->sawOther = true;
+	e->segSkip = 0;
 	if (e->nSlots >= JIT_MAX_SLOTS) {
 		if (pcAfter < 0) {
 			_b(e, COND_AL, ctx->jit->exitPlain);
@@ -916,6 +951,8 @@ enum {
 static void _emitHelperCall(struct ARMJitInsnContext* ctx, unsigned cond, uintptr_t handler, bool branchClass, int chain, uint32_t chainTarget) {
 	struct ARMJit* jit = ctx->jit;
 	struct ARMJitEmitter* e = ctx->e;
+	e->sawOther = true;
+	e->segSkip = 0;
 	uint32_t* skip = NULL;
 	int32_t pc = _pcValue(ctx);
 
@@ -1041,6 +1078,8 @@ static void _memReg(struct ARMJitEmitter* e, uint32_t base, unsigned rt, unsigne
 static void _emitMemoryWithFallback(struct ARMJitInsnContext* ctx, const struct ARMJitFastMem* m, uintptr_t handler) {
 	struct ARMJitEmitter* e = ctx->e;
 	bool rom = ctx->block->guestAddress >> 24 >= GBA_REGION_ROM0;
+	e->sawOther = true;
+	e->segSkip = 0;
 	if (e->nDeferred >= sizeof(e->deferred) / sizeof(e->deferred[0])) {
 		e->overflow = true;
 		return;
@@ -1530,7 +1569,7 @@ static void _armEmitDataProcessing(struct ARMJitInsnContext* ctx, uint32_t opcod
 	uint32_t* skip = NULL;
 
 	if (cond == COND_NV) {
-		_cyclesAndCheck(ctx);
+		_nativeCycles(ctx);
 		return;
 	}
 
@@ -1632,7 +1671,7 @@ static void _armEmitDataProcessing(struct ARMJitInsnContext* ctx, uint32_t opcod
 	if (skip) {
 		_patchBranch(skip, e->ptr);
 	}
-	_cyclesAndCheck(ctx);
+	_nativeCycles(ctx);
 }
 
 static void _armEmitInstruction(struct ARMJitInsnContext* ctx, uint32_t opcode, bool* endBlock) {
@@ -1717,7 +1756,7 @@ static bool _thumbEmitNativeInstruction(struct ARMJitInsnContext* ctx, uint16_t 
 			_dpReg(e, COND_AL, ALU_MOV, true, R0, 0, R1, op, imm);
 			_storeGuestReg(ctx, R0, rd);
 			_mrsFlags(e, R8);
-			_cyclesAndCheck(ctx);
+			_nativeCycles(ctx);
 			return true;
 		}
 		// ADD/SUB register or imm3
@@ -1733,7 +1772,7 @@ static bool _thumbEmitNativeInstruction(struct ARMJitInsnContext* ctx, uint16_t 
 		}
 		_storeGuestReg(ctx, R0, rd);
 		_mrsFlags(e, R8);
-		_cyclesAndCheck(ctx);
+		_nativeCycles(ctx);
 		return true;
 	}
 	case 1: {
@@ -1763,7 +1802,7 @@ static bool _thumbEmitNativeInstruction(struct ARMJitInsnContext* ctx, uint16_t 
 			break;
 		}
 		_mrsFlags(e, R8);
-		_cyclesAndCheck(ctx);
+		_nativeCycles(ctx);
 		return true;
 	}
 	case 2:
@@ -1837,7 +1876,7 @@ static bool _thumbEmitNativeInstruction(struct ARMJitInsnContext* ctx, uint16_t 
 				break;
 			}
 			_mrsFlags(e, R8);
-			_cyclesAndCheck(ctx);
+			_nativeCycles(ctx);
 			return true;
 		}
 		if ((opcode & 0xFC00) == 0x4400) {
@@ -1854,14 +1893,14 @@ static bool _thumbEmitNativeInstruction(struct ARMJitInsnContext* ctx, uint16_t 
 				_loadGuestReg(ctx, R1, hm, 0);
 				_dpReg(e, COND_AL, ALU_ADD, false, R0, R0, R1, SHIFT_LSL, 0);
 				_storeGuestReg(ctx, R0, hd);
-				_cyclesAndCheck(ctx);
+				_nativeCycles(ctx);
 				return true;
 			case 1: // CMP
 				_loadGuestReg(ctx, R0, hd, 0);
 				_loadGuestReg(ctx, R1, hm, 0);
 				_dpReg(e, COND_AL, ALU_CMP, true, 0, R0, R1, SHIFT_LSL, 0);
 				_mrsFlags(e, R8);
-				_cyclesAndCheck(ctx);
+				_nativeCycles(ctx);
 				return true;
 			case 2: // MOV
 				if (hd == ARM_PC) {
@@ -1869,7 +1908,7 @@ static bool _thumbEmitNativeInstruction(struct ARMJitInsnContext* ctx, uint16_t 
 				}
 				_loadGuestReg(ctx, R1, hm, 0);
 				_storeGuestReg(ctx, R1, hd);
-				_cyclesAndCheck(ctx);
+				_nativeCycles(ctx);
 				return true;
 			default:
 				return false; // BX
@@ -1890,7 +1929,7 @@ static bool _thumbEmitNativeInstruction(struct ARMJitInsnContext* ctx, uint16_t 
 				_loadConst(e, R0, value);
 			}
 			_storeGuestReg(ctx, R0, reg);
-			_cyclesAndCheck(ctx);
+			_nativeCycles(ctx);
 			return true;
 		}
 		if ((opcode & 0xFF00) == 0xB000) {
@@ -1899,7 +1938,7 @@ static bool _thumbEmitNativeInstruction(struct ARMJitInsnContext* ctx, uint16_t 
 			_loadGuestReg(ctx, R0, ARM_SP, 0);
 			_dpImm(e, COND_AL, (opcode & 0x80) ? ALU_SUB : ALU_ADD, false, R0, R0, imm);
 			_storeGuestReg(ctx, R0, ARM_SP);
-			_cyclesAndCheck(ctx);
+			_nativeCycles(ctx);
 			return true;
 		}
 		return false;
@@ -1910,7 +1949,7 @@ static bool _thumbEmitNativeInstruction(struct ARMJitInsnContext* ctx, uint16_t 
 			uint32_t value = ctx->block->guestAddress + (uint32_t) _pcValue(ctx) + (uint32_t) offset;
 			_loadConst(e, R0, value);
 			_storeGuestReg(ctx, R0, ARM_LR);
-			_cyclesAndCheck(ctx);
+			_nativeCycles(ctx);
 			return true;
 		}
 		return false;
@@ -1976,6 +2015,46 @@ static bool _isJittableRegion(uint32_t address) {
 	default:
 		return false;
 	}
+}
+
+/* Counts how many instructions from START on translate to native code with a
+ * fixed cost (r6 plus at most one cycle), by translating them on a scratch
+ * emitter. Such runs need only one event check up front (see _compile). */
+static unsigned _scanNative(const struct ARMJitInsnContext* ctx, unsigned start, unsigned max, struct ARMJitEmitter* scratch, uint32_t* buffer, size_t words) {
+	struct ARMJitInsnContext c = *ctx;
+	c.e = scratch;
+	unsigned n = 0;
+	unsigned j;
+	for (j = start; j < max && n < 64; ++j) {
+		scratch->start = buffer;
+		scratch->ptr = buffer;
+		scratch->end = buffer + words;
+		scratch->overflow = false;
+		scratch->nConsts = 0;
+		scratch->nStubFixups = 0;
+		scratch->nSlots = 0;
+		scratch->nBails = 0;
+		scratch->nDeferred = 0;
+		scratch->segSkip = 0;
+		scratch->sawNative = false;
+		scratch->sawOther = false;
+		c.index = j;
+		bool endBlock = false;
+		if (c.thumb) {
+			uint16_t opcode;
+			LOAD_16(opcode, j * 2, c.block->hostCode);
+			_thumbEmitInstruction(&c, opcode, &endBlock);
+		} else {
+			uint32_t opcode;
+			LOAD_32(opcode, j * 4, c.block->hostCode);
+			_armEmitInstruction(&c, opcode, &endBlock);
+		}
+		if (!scratch->sawNative || scratch->sawOther || endBlock || scratch->overflow) {
+			break;
+		}
+		++n;
+	}
+	return n;
 }
 
 static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uint32_t address, bool thumb) {
@@ -2055,8 +2134,39 @@ static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uin
 	unsigned i;
 	unsigned f;
 	bool endBlock = false;
+	struct ARMJitEmitter* scratch = malloc(sizeof(*scratch));
+	uint32_t* scratchBuffer = malloc(JIT_SCRATCH_WORDS * 4);
+	if (!scratch || !scratchBuffer) {
+		free(scratch);
+		free(scratchBuffer);
+		free(e);
+		return NULL;
+	}
+	memset(scratch, 0, sizeof(*scratch));
 	for (i = 0; i < maxInsns && !endBlock && !e->overflow; ++i) {
 		ctx.index = i;
+		if (!e->segSkip) {
+			/* A run of N native instructions: as long as the first N-1 can't
+			 * reach the next event, only the last one needs an event check.
+			 * Each costs at most r6 + 1, so check r5 + (N-1)(r6+1) < r7 once
+			 * here; otherwise leave and let the interpreter step through the
+			 * run, which is exactly what the per-instruction checks would do. */
+			unsigned run = _scanNative(&ctx, i, maxInsns, scratch, scratchBuffer, JIT_SCRATCH_WORDS);
+			if (run >= 3) {
+				unsigned covered = run - 1;
+				_dpImm(e, COND_AL, ALU_MOV, false, R3, 0, covered);
+				_emit(e, 0xE0200090 | (R12 << 16) | (R5 << 12) | (R6 << 8) | R3); // mla r12, r3, r6, r5
+				_dpImm(e, COND_AL, ALU_ADD, false, R12, R12, covered);
+				_dpReg(e, COND_AL, ALU_CMP, true, 0, R12, R7, SHIFT_LSL, 0);
+				if (e->nBails < sizeof(e->bails) / sizeof(e->bails[0])) {
+					e->bails[e->nBails].site = _bPlaceholder(e, COND_GE);
+					e->bails[e->nBails].pcBefore = thumb ? (int32_t) (i * 2 + 2) : (int32_t) (i * 4 + 4);
+					++e->nBails;
+					e->segSkip = covered;
+				}
+			}
+		}
+		bool skipping = e->segSkip > 0;
 		if (thumb) {
 			uint16_t opcode;
 			LOAD_16(opcode, i * 2, block->hostCode);
@@ -2066,7 +2176,12 @@ static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uin
 			LOAD_32(opcode, i * 4, block->hostCode);
 			_armEmitInstruction(&ctx, opcode, &endBlock);
 		}
+		if (skipping && e->segSkip) {
+			--e->segSkip;
+		}
 	}
+	free(scratch);
+	free(scratchBuffer);
 	block->length = i;
 	if (!endBlock && i) {
 		// Fell off the end of the block: continue with the next block
@@ -2127,6 +2242,15 @@ static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uin
 			_b(e, COND_AL, thumb ? jit->exitSyncThumb : jit->exitSyncArm);
 		}
 		_patchBranch(e->stubFixups[f].site, stubs[insn]);
+	}
+
+	// Bails before a run that might reach the next event: step it in the interpreter
+	for (f = 0; f < e->nBails; ++f) {
+		_patchBranch(e->bails[f].site, e->ptr);
+		_dpImm(e, COND_AL, ALU_MOV, false, R1, 0, 2);
+		_str(e, R1, R4, jit->offExitRequest);
+		_addImm(e, R0, R10, e->bails[f].pcBefore);
+		_b(e, COND_AL, thumb ? jit->exitSyncThumb : jit->exitSyncArm);
 	}
 
 	// Constant pool
@@ -2356,22 +2480,35 @@ void ARMJitRunLoop(struct ARMCore* cpu) {
 		bool thumb = cpu->executionMode == MODE_THUMB;
 		uint32_t address = cpu->gprs[ARM_PC] - (thumb ? WORD_SIZE_THUMB : WORD_SIZE_ARM);
 		struct ARMJitBlock* block = _lookup(jit, address, thumb);
-		if (!block) {
+		if (!block && !jit->stepping) {
 			block = _compile(jit, cpu, address, thumb);
 		}
 		if (!block) {
-			++jit->stats.compileFailures;
-			jit->stats.lastFailAddress = address | thumb;
+			if (!jit->stepping) {
+				++jit->stats.compileFailures;
+				jit->stats.lastFailAddress = address | thumb;
+			}
 		} else if (!_prefetchMatches(cpu, block)) {
 			++jit->stats.prefetchMismatches;
 			jit->stats.lastFailAddress = address | thumb;
 			block = NULL;
 		}
-		if (!block) {
-			cpu->jitLastSlot = NULL;
-			ARMStepOne(cpu);
-			++jit->stats.interpretedSteps;
-			continue;
+		if (!block || jit->stepping) {
+			/* After a bail, take at least one interpreter step, then keep
+			 * stepping until an existing block's entry turns up, so that the
+			 * event lands on exactly the same instruction as in the
+			 * interpreter without compiling blocks at odd entry points */
+			if (jit->stepping && block && jit->stepping < JIT_STEP_LIMIT) {
+				jit->stepping = 0;
+			} else {
+				if (jit->stepping) {
+					--jit->stepping;
+				}
+				cpu->jitLastSlot = NULL;
+				ARMStepOne(cpu);
+				++jit->stats.interpretedSteps;
+				continue;
+			}
 		}
 		if (cpu->jitLastSlot) {
 			if (cpu->jitLastSlotTarget == (block->guestAddress | block->thumb)) {
@@ -2386,6 +2523,10 @@ void ARMJitRunLoop(struct ARMCore* cpu) {
 		jit->enter(cpu, block->entry);
 		cpu->jitCurrentBlock = NULL;
 		++jit->stats.blocksEntered;
+		if (cpu->jitExitRequest == 2) {
+			cpu->jitExitRequest = 0;
+			jit->stepping = JIT_STEP_LIMIT;
+		}
 	}
 	cpu->irqh.processEvents(cpu);
 }
