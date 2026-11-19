@@ -172,6 +172,9 @@ struct ARMJit {
 	/* Shared out-of-line code, so blocks stay small (see _buildStubs) */
 	uint32_t* helperStub[2]; // [thumb]
 	uint32_t* memStub[2][2][8]; // [thumb][running from ROM][kind]
+	uint32_t* multiPrepStub[2]; // [store]
+	uint32_t* multiDoneStub[2][2][2]; // [thumb][running from ROM][load]
+	uint32_t* romLiteralStub;
 
 	struct ARMJitBlock* hash[JIT_HASH_SIZE];
 	struct ARMJitBlock* blocks;
@@ -842,6 +845,129 @@ static uint32_t* _buildMemStub(struct ARMJit* jit, struct ARMJitEmitter* e, stru
 	return entry;
 }
 
+/* First half of an inline LDM/STM on EWRAM/IWRAM (see _emitFastMultiple).
+ * In: r0 = lowest address, r3 = word count. Out: EQ with r1 = host pointer and
+ * r12 = 1 for IWRAM, 0 for EWRAM; NE if the interpreter must do the transfer
+ * (unaligned, not RAM, wrapping around the region, or a store next to
+ * translated code). Keeps r2 and r3. */
+static uint32_t* _buildMultiPrepStub(struct ARMJit* jit, struct ARMJitEmitter* e, struct GBA* gba, bool store) {
+	uint32_t* slow[6] = {0};
+	unsigned nSlow = 0;
+	uint32_t* litPages = e->ptr;
+	_emit(e, (uint32_t) (uintptr_t) jit->pages);
+	uint32_t* litWram = e->ptr;
+	_emit(e, (uint32_t) (uintptr_t) gba->memory.wram);
+
+	uint32_t* entry = e->ptr;
+	_dpImm(e, COND_AL, ALU_TST, true, 0, R0, 3);
+	slow[nSlow++] = _bPlaceholder(e, COND_NE);
+	_dpReg(e, COND_AL, ALU_MOV, false, R12, 0, R0, SHIFT_LSR, 24);
+	_dpImm(e, COND_AL, ALU_CMP, true, 0, R12, GBA_REGION_IWRAM);
+	uint32_t* iwram = _bPlaceholder(e, COND_EQ);
+	_dpImm(e, COND_AL, ALU_CMP, true, 0, R12, GBA_REGION_EWRAM);
+	slow[nSlow++] = _bPlaceholder(e, COND_NE);
+	// r1 = offset into the combined buffer, r12 = end of the region there
+	_dpReg(e, COND_AL, ALU_MOV, false, R1, 0, R0, SHIFT_LSL, 14);
+	_dpReg(e, COND_AL, ALU_MOV, false, R1, 0, R1, SHIFT_LSR, 14);
+	_dpImm(e, COND_AL, ALU_MOV, false, R12, 0, ARM_JIT_EWRAM_SIZE);
+	uint32_t* common = _bPlaceholder(e, COND_AL);
+	_patchBranch(iwram, e->ptr);
+	_dpReg(e, COND_AL, ALU_MOV, false, R1, 0, R0, SHIFT_LSL, 17);
+	_dpReg(e, COND_AL, ALU_MOV, false, R1, 0, R1, SHIFT_LSR, 17);
+	_dpImm(e, COND_AL, ALU_ADD, false, R1, R1, ARM_JIT_EWRAM_SIZE);
+	_dpImm(e, COND_AL, ALU_MOV, false, R12, 0, ARM_JIT_EWRAM_SIZE + ARM_JIT_IWRAM_SIZE);
+	_patchBranch(common, e->ptr);
+	// The whole transfer must stay inside the region (no mirroring wraparound)
+	_dpReg(e, COND_AL, ALU_ADD, false, R0, R1, R3, SHIFT_LSL, 2);
+	_dpReg(e, COND_AL, ALU_CMP, true, 0, R0, R12, SHIFT_LSL, 0);
+	slow[nSlow++] = _bPlaceholder(e, 0x8); // HI
+	if (store) {
+		// At most 16 words: the first and last word's pages cover them all
+		_ldrNear(e, R12, litPages);
+		_dpImm(e, COND_AL, ALU_SUB, false, R0, R0, 4);
+		_emit(e, 0xE7D00000 | (R12 << 16) | (R0 << 12) | (ARM_JIT_PAGE_SHIFT << 7) | (SHIFT_LSR << 5) | R0); // ldrb r0, [r12, r0, lsr #PAGE_SHIFT]
+		_dpImm(e, COND_AL, ALU_CMP, true, 0, R0, 0);
+		slow[nSlow++] = _bPlaceholder(e, COND_NE);
+		_emit(e, 0xE7D00000 | (R12 << 16) | (R0 << 12) | (ARM_JIT_PAGE_SHIFT << 7) | (SHIFT_LSR << 5) | R1); // ldrb r0, [r12, r1, lsr #PAGE_SHIFT]
+		_dpImm(e, COND_AL, ALU_CMP, true, 0, R0, 0);
+		slow[nSlow++] = _bPlaceholder(e, COND_NE);
+	}
+	_dpImm(e, COND_AL, ALU_CMP, true, 0, R1, ARM_JIT_EWRAM_SIZE);
+	_dpImm(e, 0x3, ALU_MOV, false, R12, 0, 0); // movlo
+	_dpImm(e, 0x2, ALU_MOV, false, R12, 0, 1); // movhs
+	_ldrNear(e, R0, litWram);
+	_dpReg(e, COND_AL, ALU_ADD, false, R1, R0, R1, SHIFT_LSL, 0);
+	_dpReg(e, COND_AL, ALU_CMP, true, 0, R0, R0, SHIFT_LSL, 0); // EQ
+	_bx(e, RLR);
+	unsigned i;
+	for (i = 0; i < nSlow; ++i) {
+		_patchBranch(slow[i], e->ptr);
+	}
+	_dpImm(e, COND_AL, ALU_MOV, true, R0, 0, 1); // NE
+	_bx(e, RLR);
+	return entry;
+}
+
+/* Second half: charges the transfer like GBALoadMultiple/GBAStoreMultiple.
+ * In: r3 = word count, r12 = 1 for IWRAM, r2 = guest PC value (ROM variant).
+ * Wait: IWRAM = count; EWRAM = (S - N) + count * (S + 1); loads add one more.
+ * Out: LT, or GE if an event is due. */
+static uint32_t* _buildMultiDoneStub(struct ARMJitEmitter* e, struct GBA* gba, bool thumb, bool rom, bool load) {
+	uint32_t* litSeq = e->ptr;
+	_emit(e, (uint32_t) (uintptr_t) &gba->memory.waitstatesSeq32[GBA_REGION_EWRAM]);
+	uint32_t* litNonseq = e->ptr;
+	_emit(e, (uint32_t) (uintptr_t) &gba->memory.waitstatesNonseq32[GBA_REGION_EWRAM]);
+	uint32_t* litPrefetch = e->ptr;
+	_emit(e, (uint32_t) (uintptr_t) &gba->memory.prefetch);
+	uint32_t* litLastPrefetchedPc = e->ptr;
+	_emit(e, (uint32_t) (uintptr_t) &gba->memory.lastPrefetchedPc);
+
+	uint32_t* entry = e->ptr;
+	_dpImm(e, COND_AL, ALU_CMP, true, 0, R12, 0);
+	uint32_t* iwram = _bPlaceholder(e, COND_NE);
+	_ldrNear(e, R12, litSeq);
+	_memImm(e, COND_AL, 0x05500000, R0, R12, 0); // ldrb r0, [r12] (S)
+	_ldrNear(e, R12, litNonseq);
+	_memImm(e, COND_AL, 0x05500000, R1, R12, 0); // ldrb r1, [r12] (N)
+	_dpImm(e, COND_AL, ALU_ADD, false, R12, R3, 1);
+	_emit(e, 0xE0000090 | (R0 << 16) | (R12 << 8) | R0); // mul r0, r0, r12
+	_dpReg(e, COND_AL, ALU_SUB, false, R0, R0, R1, SHIFT_LSL, 0);
+	_dpReg(e, COND_AL, ALU_ADD, false, R3, R3, R0, SHIFT_LSL, 0);
+	_patchBranch(iwram, e->ptr);
+	if (load) {
+		_dpImm(e, COND_AL, ALU_ADD, false, R3, R3, 1);
+	}
+	if (rom) {
+		_ldrNear(e, R12, litPrefetch);
+		_memImm(e, COND_AL, 0x05500000, R12, R12, 0); // ldrb r12, [r12]
+		_dpImm(e, COND_AL, ALU_CMP, true, 0, R12, 0);
+		uint32_t* noStall = _bPlaceholder(e, COND_EQ);
+		_emitMemStubStall(e, thumb, litLastPrefetchedPc);
+		_patchBranch(noStall, e->ptr);
+	}
+	_emitMemStubCharge(e, thumb);
+	return entry;
+}
+
+/* Charges a Thumb PC-relative load from ROM whose value is a constant.
+ * In: r0 = region of the literal. The interpreter adds that region's 32-bit
+ * wait + 2 and turns the fetch non-sequential; with r6 that is wait + N + 3.
+ * Out: LT, or GE if an event is due. */
+static uint32_t* _buildRomLiteralStub(struct ARMJitEmitter* e, struct GBA* gba) {
+	uint32_t* litWait = e->ptr;
+	_emit(e, (uint32_t) (uintptr_t) gba->memory.waitstatesNonseq32);
+	uint32_t* entry = e->ptr;
+	_ldrNear(e, R12, litWait);
+	_emit(e, 0xE7D00000 | (R12 << 16) | (R0 << 12) | R0); // ldrb r0, [r12, r0]
+	_ldr(e, R12, R4, offsetof(struct ARMCore, memory.activeNonseqCycles16));
+	_dpReg(e, COND_AL, ALU_ADD, false, R5, R5, R0, SHIFT_LSL, 0);
+	_dpReg(e, COND_AL, ALU_ADD, false, R5, R5, R12, SHIFT_LSL, 0);
+	_dpImm(e, COND_AL, ALU_ADD, false, R5, R5, 3);
+	_dpReg(e, COND_AL, ALU_CMP, true, 0, R5, R7, SHIFT_LSL, 0);
+	_bx(e, RLR);
+	return entry;
+}
+
 static bool _buildTrampolines(struct ARMJit* jit, struct GBA* gba) {
 	struct ARMJitEmitter e = {0};
 	e.start = jit->mem;
@@ -894,8 +1020,13 @@ static bool _buildTrampolines(struct ARMJit* jit, struct GBA* gba) {
 			for (kind = 0; kind < 8; ++kind) {
 				jit->memStub[thumb][rom][kind] = _buildMemStub(jit, &e, gba, thumb, rom, kind);
 			}
+			jit->multiDoneStub[thumb][rom][0] = _buildMultiDoneStub(&e, gba, thumb, rom, false);
+			jit->multiDoneStub[thumb][rom][1] = _buildMultiDoneStub(&e, gba, thumb, rom, true);
 		}
 	}
+	jit->multiPrepStub[0] = _buildMultiPrepStub(jit, &e, gba, false);
+	jit->multiPrepStub[1] = _buildMultiPrepStub(jit, &e, gba, true);
+	jit->romLiteralStub = _buildRomLiteralStub(&e, gba);
 
 	return !e.overflow;
 }
@@ -1012,6 +1143,21 @@ static void _cyclesAndCheck(struct ARMJitInsnContext* ctx) {
 	_flagsClobber(e);
 	_dpReg(e, COND_AL, ALU_ADD, false, R5, R5, R6, SHIFT_LSL, 0);
 	_dpReg(e, COND_AL, ALU_CMP, true, 0, R5, R7, SHIFT_LSL, 0);
+	if (e->nStubFixups < sizeof(e->stubFixups) / sizeof(e->stubFixups[0])) {
+		e->stubFixups[e->nStubFixups].site = _bPlaceholder(e, COND_GE);
+		e->stubFixups[e->nStubFixups].insn = ctx->index;
+		++e->nStubFixups;
+	} else {
+		e->overflow = true;
+	}
+}
+
+/* Leaves at the end of this instruction when the compare just made (by a
+ * stub) found an event due */
+static void _eventExitIfGE(struct ARMJitInsnContext* ctx) {
+	struct ARMJitEmitter* e = ctx->e;
+	e->sawOther = true;
+	e->segSkip = 0;
 	if (e->nStubFixups < sizeof(e->stubFixups) / sizeof(e->stubFixups[0])) {
 		e->stubFixups[e->nStubFixups].site = _bPlaceholder(e, COND_GE);
 		e->stubFixups[e->nStubFixups].insn = ctx->index;
@@ -1377,18 +1523,12 @@ static void _emitMemoryWithFallback(struct ARMJitInsnContext* ctx, const struct 
 /* Thumb PC-relative load from ROM: the value is a constant */
 static void _emitThumbRomLiteral(struct ARMJitInsnContext* ctx, unsigned rd, uint32_t address, uint32_t value) {
 	struct ARMJitEmitter* e = ctx->e;
-	struct GBA* gba = ctx->gba;
+	_flagsClobber(e);
 	_loadConst(e, R1, value);
 	_storeGuestReg(ctx, R1, rd);
-	_loadConst(e, R12, (uint32_t) (uintptr_t) &gba->memory.waitstatesNonseq32[address >> 24]);
-	_memImm(e, COND_AL, 0x05500000, R0, R12, 0); // ldrb r0, [r12]
-	_dpImm(e, COND_AL, ALU_ADD, false, R0, R0, 2);
-	_dpReg(e, COND_AL, ALU_ADD, false, R5, R5, R0, SHIFT_LSL, 0);
-	_ldr(e, R0, R4, offsetof(struct ARMCore, memory.activeNonseqCycles16));
-	_ldr(e, R1, R4, offsetof(struct ARMCore, memory.activeSeqCycles16));
-	_dpReg(e, COND_AL, ALU_ADD, false, R5, R5, R0, SHIFT_LSL, 0);
-	_dpReg(e, COND_AL, ALU_SUB, false, R5, R5, R1, SHIFT_LSL, 0);
-	_cyclesAndCheck(ctx);
+	_dpImm(e, COND_AL, ALU_MOV, false, R0, 0, address >> 24);
+	_bl(e, ctx->jit->romLiteralStub);
+	_eventExitIfGE(ctx);
 }
 
 static bool _thumbEmitMemory(struct ARMJitInsnContext* ctx, uint16_t opcode, uintptr_t handler) {
@@ -1476,7 +1616,8 @@ static bool _thumbEmitMemory(struct ARMJitInsnContext* ctx, uint16_t opcode, uin
 static void _emitFastMultiple(struct ARMJitInsnContext* ctx, bool load, unsigned rn, uint16_t mask, unsigned mode,
                               bool writeback, uintptr_t handler) {
 	struct ARMJitEmitter* e = ctx->e;
-	struct GBA* gba = ctx->gba;
+	struct ARMJit* jit = ctx->jit;
+	bool rom = ctx->block->guestAddress >> 24 >= GBA_REGION_ROM0;
 	unsigned count = popcount32(mask);
 	int32_t start;
 	int32_t delta;
@@ -1486,44 +1627,23 @@ static void _emitFastMultiple(struct ARMJitInsnContext* ctx, bool load, unsigned
 	case 2: start = 4 - 4 * (int32_t) count; delta = -4 * (int32_t) count; break;
 	default: start = -4 * (int32_t) count; delta = -4 * (int32_t) count; break;
 	}
-	uint32_t* slow[6] = {0};
+	if (e->nDeferred >= sizeof(e->deferred) / sizeof(e->deferred[0])) {
+		e->overflow = true;
+		return;
+	}
 
 	_flagsClobber(e);
 	_loadGuestReg(ctx, R0, rn, 0);
 	if (start) {
 		_addImm(e, R0, R0, start);
 	}
-	_dpImm(e, COND_AL, ALU_TST, true, 0, R0, 3);
-	slow[0] = _bPlaceholder(e, COND_NE);
-	_dpReg(e, COND_AL, ALU_MOV, false, R2, 0, R0, SHIFT_LSR, 24);
-	_dpImm(e, COND_AL, ALU_SUB, false, R2, R2, 2);
-	_dpImm(e, COND_AL, ALU_CMP, true, 0, R2, 1);
-	slow[1] = _bPlaceholder(e, 0x8); // HI
-	_dpImm(e, COND_AL, ALU_CMP, true, 0, R2, 0);
-	_dpReg(e, COND_EQ, ALU_MOV, false, R3, 0, R0, SHIFT_LSL, 14);
-	_dpReg(e, COND_EQ, ALU_MOV, false, R3, 0, R3, SHIFT_LSR, 14);
-	_dpReg(e, COND_NE, ALU_MOV, false, R3, 0, R0, SHIFT_LSL, 17);
-	_dpReg(e, COND_NE, ALU_MOV, false, R3, 0, R3, SHIFT_LSR, 17);
-	_dpImm(e, COND_NE, ALU_ADD, false, R3, R3, ARM_JIT_EWRAM_SIZE);
-	// The whole transfer must stay inside the region (no mirroring wraparound)
-	_addImm(e, R12, R3, 4 * count);
-	_dpImm(e, COND_EQ, ALU_MOV, false, R1, 0, ARM_JIT_EWRAM_SIZE);
-	_dpImm(e, COND_NE, ALU_MOV, false, R1, 0, ARM_JIT_EWRAM_SIZE + ARM_JIT_IWRAM_SIZE);
-	_dpReg(e, COND_AL, ALU_CMP, true, 0, R12, R1, SHIFT_LSL, 0);
-	slow[2] = _bPlaceholder(e, 0x8); // HI
-	if (!load) {
-		_loadConst(e, R12, (uint32_t) (uintptr_t) ctx->jit->pages);
-		_memReg(e, 0x07D00000, R1, R12, R3, SHIFT_LSR, ARM_JIT_PAGE_SHIFT); // ldrb r1, [r12, r3, lsr #PAGE_SHIFT]
-		_dpImm(e, COND_AL, ALU_CMP, true, 0, R1, 0);
-		slow[3] = _bPlaceholder(e, COND_NE);
-		_addImm(e, R1, R3, 4 * count - 4);
-		_memReg(e, 0x07D00000, R1, R12, R1, SHIFT_LSR, ARM_JIT_PAGE_SHIFT);
-		_dpImm(e, COND_AL, ALU_CMP, true, 0, R1, 0);
-		slow[4] = _bPlaceholder(e, COND_NE);
+	_dpImm(e, COND_AL, ALU_MOV, false, R3, 0, count);
+	if (rom) {
+		_addImm(e, R2, R10, _pcValue(ctx)); // for the prefetch stall
 	}
+	_bl(e, jit->multiPrepStub[!load]);
+	uint32_t* slow = _bPlaceholder(e, COND_NE);
 
-	_loadConst(e, R12, (uint32_t) (uintptr_t) gba->memory.wram);
-	_dpReg(e, COND_AL, ALU_ADD, false, R1, R12, R3, SHIFT_LSL, 0);
 	unsigned reg;
 	int32_t offset = 0;
 	for (reg = 0; reg < 16; ++reg) {
@@ -1544,56 +1664,16 @@ static void _emitFastMultiple(struct ARMJitInsnContext* ctx, bool load, unsigned
 		_addImm(e, R0, R0, delta);
 		_storeGuestReg(ctx, R0, rn);
 	}
+	_bl(e, jit->multiDoneStub[ctx->thumb][rom][load]);
+	_eventExitIfGE(ctx);
 
-	// Wait: IWRAM = count; EWRAM = (S - N) + count * (S + 1); loads add one more
-	_dpImm(e, COND_AL, ALU_CMP, true, 0, R2, 0);
-	_dpImm(e, COND_NE, ALU_MOV, false, R0, 0, count + (load ? 1 : 0));
-	slow[5] = NULL;
-	{
-		uint32_t* iwramDone = _bPlaceholder(e, COND_NE);
-		_loadConst(e, R12, (uint32_t) (uintptr_t) &gba->memory.waitstatesSeq32[GBA_REGION_EWRAM]);
-		_memImm(e, COND_AL, 0x05500000, R1, R12, 0); // ldrb r1, [r12] (S)
-		_loadConst(e, R12, (uint32_t) (uintptr_t) &gba->memory.waitstatesNonseq32[GBA_REGION_EWRAM]);
-		_memImm(e, COND_AL, 0x05500000, R2, R12, 0); // ldrb r2, [r12] (N)
-		_dpImm(e, COND_AL, ALU_MOV, false, R3, 0, count + 1);
-		_emit(e, 0xE0000000 | (R0 << 16) | (R3 << 8) | 0x90 | R1); // mul r0, r1, r3
-		_dpReg(e, COND_AL, ALU_SUB, false, R0, R0, R2, SHIFT_LSL, 0);
-		_dpImm(e, COND_AL, ALU_ADD, false, R0, R0, count + (load ? 1 : 0));
-		_patchBranch(iwramDone, e->ptr);
-	}
-	if (ctx->block->guestAddress >> 24 >= GBA_REGION_ROM0) {
-		uint32_t* noStall;
-		_loadConst(e, R12, (uint32_t) (uintptr_t) &gba->memory.prefetch);
-		_memImm(e, COND_AL, 0x05500000, R12, R12, 0);
-		_dpImm(e, COND_AL, ALU_CMP, true, 0, R12, 0);
-		noStall = _bPlaceholder(e, COND_EQ);
-		_mov(e, R1, R0);
-		_mov(e, R0, R4);
-		_addImm(e, R2, R10, _pcValue(ctx));
-		_str(e, R2, R4, offsetof(struct ARMCore, gprs) + 4 * ARM_PC);
-		_loadConst(e, R12, (uint32_t) (uintptr_t) gba->cpu->memory.stall);
-		_blx(e, R12);
-		_patchBranch(noStall, e->ptr);
-	}
-	_dpReg(e, COND_AL, ALU_ADD, false, R5, R5, R0, SHIFT_LSL, 0);
-	if (ctx->thumb) {
-		_ldr(e, R0, R4, offsetof(struct ARMCore, memory.activeNonseqCycles16));
-		_ldr(e, R1, R4, offsetof(struct ARMCore, memory.activeSeqCycles16));
-	} else {
-		_ldr(e, R0, R4, offsetof(struct ARMCore, memory.activeNonseqCycles32));
-		_ldr(e, R1, R4, offsetof(struct ARMCore, memory.activeSeqCycles32));
-	}
-	_dpReg(e, COND_AL, ALU_ADD, false, R5, R5, R0, SHIFT_LSL, 0);
-	_dpReg(e, COND_AL, ALU_SUB, false, R5, R5, R1, SHIFT_LSL, 0);
-	_cyclesAndCheck(ctx);
-	uint32_t* done = _bPlaceholder(e, COND_AL);
-
-	unsigned i;
-	for (i = 0; i < sizeof(slow) / sizeof(*slow); ++i) {
-		_patchBranch(slow[i], e->ptr);
-	}
-	_emitHelperCall(ctx, COND_AL, handler, false, CHAIN_NONE, 0);
-	_patchBranch(done, e->ptr);
+	// Anything the stub turned down goes to the interpreter, out of line
+	e->deferred[e->nDeferred].site = slow;
+	e->deferred[e->nDeferred].back = e->ptr;
+	e->deferred[e->nDeferred].index = ctx->index;
+	e->deferred[e->nDeferred].kind = 2;
+	e->deferred[e->nDeferred].handler = handler;
+	++e->nDeferred;
 }
 
 static bool _thumbEmitMultiple(struct ARMJitInsnContext* ctx, uint16_t opcode, uintptr_t handler) {
@@ -2617,6 +2697,12 @@ static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uin
 			}
 			_emitHelperCall(&ctx, COND_AL, e->deferred[f].handler, false, CHAIN_IF_TAKEN, e->deferred[f].target);
 			_msrFlags(e, R8);
+			_b(e, COND_AL, e->deferred[f].back);
+			continue;
+		}
+		if (e->deferred[f].kind == 2) {
+			// Multiple transfer the fast path turned down
+			_emitHelperCall(&ctx, COND_AL, e->deferred[f].handler, false, CHAIN_NONE, 0);
 			_b(e, COND_AL, e->deferred[f].back);
 			continue;
 		}
