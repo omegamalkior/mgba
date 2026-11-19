@@ -1867,6 +1867,66 @@ static bool _armEmitMemory(struct ARMJitInsnContext* ctx, uint32_t opcode, uintp
 	return true;
 }
 
+/* ARM LDRH/LDRSH/LDRSB/STRH. Their handlers share LDR/STR's template, so the
+ * same fast path applies with a different access size. */
+static bool _armEmitMemoryHalf(struct ARMJitInsnContext* ctx, uint32_t opcode, uintptr_t handler) {
+	struct ARMJitEmitter* e = ctx->e;
+	if ((opcode >> 28) != COND_AL || (opcode & 0x0E000090) != 0x00000090 || !(opcode & 0x60)) {
+		return false;
+	}
+	bool pre = opcode & 0x01000000;
+	bool up = opcode & 0x00800000;
+	bool immediate = opcode & 0x00400000;
+	bool writeback = opcode & 0x00200000;
+	bool load = opcode & 0x00100000;
+	unsigned rn = (opcode >> 16) & 0xF;
+	unsigned rd = (opcode >> 12) & 0xF;
+	unsigned rm = opcode & 0xF;
+	unsigned sh = (opcode >> 5) & 3;
+	if (!load && sh != 1) {
+		return false; // Not ARMv4
+	}
+	if (!pre && (writeback || !immediate)) {
+		return false; // Post-indexed register offsets are rare
+	}
+	if (rd == ARM_PC || rn == ARM_PC || (!immediate && rm == ARM_PC)) {
+		return false;
+	}
+	bool doWriteback = !pre || writeback;
+	if (doWriteback && load && rn == rd) {
+		return false;
+	}
+	struct ARMJitFastMem m = {
+		.store = !load,
+		.size = sh == 2 ? 1 : 2,
+		.sign = sh != 1,
+		.guestReg = rd,
+		.writebackReg = -1
+	};
+	int32_t offset = (int32_t) (((opcode >> 4) & 0xF0) | (opcode & 0xF));
+	if (!up) {
+		offset = -offset;
+	}
+	_loadGuestReg(ctx, R0, rn, 0);
+	if (!pre) {
+		m.writebackReg = rn;
+		m.writebackDelta = offset;
+	} else {
+		if (immediate) {
+			_addImm(e, R0, R0, offset);
+		} else {
+			_loadGuestReg(ctx, R1, rm, 0);
+			_dpReg(e, COND_AL, up ? ALU_ADD : ALU_SUB, false, R0, R0, R1, SHIFT_LSL, 0);
+		}
+		if (writeback) {
+			m.writebackReg = rn;
+			m.writebackDelta = 0;
+		}
+	}
+	_emitMemoryWithFallback(ctx, &m, handler);
+	return true;
+}
+
 /* ---------------------------------------------------------------------------
  * ARM translation
  * ------------------------------------------------------------------------- */
@@ -2097,7 +2157,8 @@ static void _armEmitInstruction(struct ARMJitInsnContext* ctx, uint32_t opcode, 
 	}
 	bool branchClass = _armIsBranchClass(opcode);
 	ARMInstruction handler = _armTable[((opcode >> 16) & 0xFF0) | ((opcode >> 4) & 0x00F)];
-	if (!branchClass && (_armEmitMemory(ctx, opcode, (uintptr_t) handler) || _armEmitMultiple(ctx, opcode, (uintptr_t) handler))) {
+	if (!branchClass && (_armEmitMemory(ctx, opcode, (uintptr_t) handler) || _armEmitMemoryHalf(ctx, opcode, (uintptr_t) handler) ||
+	                     _armEmitMultiple(ctx, opcode, (uintptr_t) handler))) {
 		return;
 	}
 	int chain = CHAIN_NONE;
