@@ -60,6 +60,8 @@
 #define JIT_TRAMPOLINE_WORDS 64
 #define JIT_MAX_CHAIN_LINKS 0x8000
 #define JIT_MAX_SLOTS 64
+#define JIT_FAST_BITS 10
+#define JIT_FAST_SIZE (1 << JIT_FAST_BITS)
 
 enum {
 	R0 = 0, R1, R2, R3, R4, R5, R6, R7, R8, R9, R10, R11, R12, RSP, RLR, RPC
@@ -152,6 +154,12 @@ struct ARMJit {
 	size_t nChainLinks;
 
 	struct ARMJitStats stats;
+
+	/* Indirect branch targets: key = guest address | thumb, value = entry */
+	struct {
+		uint32_t key;
+		const uint32_t* entry;
+	} fast[JIT_FAST_SIZE];
 
 	int32_t offCycles;
 	int32_t offNextEvent;
@@ -474,6 +482,7 @@ static void _flush(struct ARMJit* jit, struct ARMCore* cpu) {
 	memset(jit->hash, 0, sizeof(jit->hash));
 	memset(jit->pageHead, 0, sizeof(jit->pageHead));
 	memset(jit->pages, 0, sizeof(jit->pages));
+	memset(jit->fast, 0, sizeof(jit->fast));
 	jit->nBlocks = 0;
 	jit->nLinks = 0;
 	jit->nChainLinks = 0;
@@ -594,6 +603,31 @@ static void _emitChainSlot(struct ARMJitInsnContext* ctx, uint32_t target, int32
 	++e->nSlots;
 }
 
+/* After an instruction that changed the PC to a value only known at run time
+ * (BX, POP {pc}, MOV pc, ...), look the new PC up in the fast table and jump
+ * straight into its block. The handler already synced PC and prefetch. */
+static void _emitIndirectExit(struct ARMJitInsnContext* ctx) {
+	struct ARMJitEmitter* e = ctx->e;
+	struct ARMJit* jit = ctx->jit;
+	_dpReg(e, COND_AL, ALU_CMP, true, 0, R5, R7, SHIFT_LSL, 0);
+	_b(e, COND_GE, jit->exitPlain);
+	_ldr(e, R0, R4, offsetof(struct ARMCore, gprs) + 4 * ARM_PC);
+	_ldr(e, R1, R4, offsetof(struct ARMCore, executionMode));
+	_dpImm(e, COND_AL, ALU_SUB, false, R0, R0, 4);
+	_dpReg(e, COND_AL, ALU_ADD, false, R0, R0, R1, SHIFT_LSL, 1); // Thumb: PC - 2
+	_dpReg(e, COND_AL, ALU_ORR, false, R0, R0, R1, SHIFT_LSL, 0); // key
+	_dpReg(e, COND_AL, ALU_MOV, false, R2, 0, R0, SHIFT_LSL, 32 - (JIT_FAST_BITS + 1));
+	_dpReg(e, COND_AL, ALU_MOV, false, R2, 0, R2, SHIFT_LSR, 32 - (JIT_FAST_BITS + 1) - 2);
+	_dpImm(e, COND_AL, ALU_BIC, false, R2, R2, 7); // index * 8
+	_loadConst(e, R3, (uint32_t) (uintptr_t) jit->fast);
+	_dpReg(e, COND_AL, ALU_ADD, false, R3, R3, R2, SHIFT_LSL, 0);
+	_ldr(e, R12, R3, 0);
+	_dpReg(e, COND_AL, ALU_CMP, true, 0, R12, R0, SHIFT_LSL, 0);
+	_b(e, COND_NE, jit->exitPlain);
+	_ldr(e, R12, R3, 4);
+	_bx(e, R12);
+}
+
 enum {
 	CHAIN_NONE = 0,
 	CHAIN_ALWAYS, // A static branch: leaves the block whenever it executes
@@ -653,7 +687,7 @@ static void _emitHelperCall(struct ARMJitInsnContext* ctx, unsigned cond, uintpt
 		_b(e, COND_GE, jit->exitPlain);
 		_emitChainSlot(ctx, chainTarget, -1);
 	} else if (branchClass) {
-		_b(e, COND_AL, jit->exitPlain);
+		_emitIndirectExit(ctx);
 	} else {
 		uint32_t* notTaken = NULL;
 		if (chain == CHAIN_IF_TAKEN) {
@@ -1822,7 +1856,16 @@ static void _flushCache(struct ARMJit* jit, void* start, size_t size) {
 	}
 }
 
+static inline unsigned _fastIndex(uint32_t key) {
+	return (key >> 1) & (JIT_FAST_SIZE - 1);
+}
+
 static void _unchain(struct ARMJit* jit, struct ARMJitBlock* block) {
+	unsigned index = _fastIndex(block->guestAddress | block->thumb);
+	if (jit->fast[index].entry == block->entry) {
+		jit->fast[index].key = 0;
+		jit->fast[index].entry = NULL;
+	}
 	struct ARMJitChainLink* link = block->incoming;
 	while (link) {
 		*link->slot = link->original;
@@ -1914,6 +1957,9 @@ void ARMJitRunLoop(struct ARMCore* cpu) {
 			}
 			cpu->jitLastSlot = NULL;
 		}
+		unsigned index = _fastIndex(block->guestAddress | block->thumb);
+		jit->fast[index].key = block->guestAddress | block->thumb;
+		jit->fast[index].entry = block->entry;
 		cpu->jitExitRequest = 0;
 		jit->enter(cpu, block->entry);
 		cpu->jitCurrentBlock = NULL;
