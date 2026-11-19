@@ -36,6 +36,9 @@
  *   r10 = guest address of the block's first instruction
  *   r11 = the block's constant pool
  */
+#ifdef JITLOG
+#include <stdio.h>
+#endif
 #ifdef JITDBG
 #include <stdio.h>
 static unsigned long long dbgThumbWords[256], dbgThumbCount[256], dbgArmWords[256], dbgArmCount[256], dbgTailWords;
@@ -76,6 +79,7 @@ static void _dbgDump(void) {
 #define JIT_MAX_SLOTS 64
 #define JIT_FAST_BITS 10
 #define JIT_FAST_SIZE (1 << JIT_FAST_BITS)
+#define JIT_HOT_PERCENT 50
 
 enum {
 	R0 = 0, R1, R2, R3, R4, R5, R6, R7, R8, R9, R10, R11, R12, RSP, RLR, RPC
@@ -149,8 +153,13 @@ struct ARMJit {
 	bool enabled;
 	uint32_t* mem;
 	size_t memWords;
+	/* Block bodies fill [codeStart, coldStart); their rarely run parts (slow
+	 * paths, exits, constants) fill [coldStart, codeEnd). Keeping the two
+	 * apart packs the code that actually runs into fewer cache lines. */
 	uint32_t* codeStart;
 	uint32_t* codePtr;
+	uint32_t* coldStart;
+	uint32_t* coldPtr;
 	uint32_t* codeEnd;
 	ARMJitCacheFlush flushCache;
 
@@ -204,6 +213,10 @@ struct ARMJitEmitter {
 	uint32_t* start;
 	uint32_t* ptr;
 	uint32_t* end;
+	/* The other of the two output areas (see _setCold) */
+	uint32_t* otherPtr;
+	uint32_t* otherEnd;
+	bool cold;
 	bool overflow;
 	uint32_t consts[JIT_MAX_CONSTS];
 	unsigned nConsts;
@@ -255,6 +268,20 @@ static inline void _emit(struct ARMJitEmitter* e, uint32_t insn) {
 		return;
 	}
 	*e->ptr++ = insn;
+}
+
+/* Switches between emitting the block body and its out-of-line part */
+static void _setCold(struct ARMJitEmitter* e, bool cold) {
+	if (e->cold == cold) {
+		return;
+	}
+	uint32_t* ptr = e->ptr;
+	uint32_t* end = e->end;
+	e->ptr = e->otherPtr;
+	e->end = e->otherEnd;
+	e->otherPtr = ptr;
+	e->otherEnd = end;
+	e->cold = cold;
 }
 
 static bool _encodeImm(uint32_t value, uint32_t* out) {
@@ -792,6 +819,7 @@ static void _flush(struct ARMJit* jit, struct ARMCore* cpu) {
 	jit->nLinks = 0;
 	jit->nChainLinks = 0;
 	jit->codePtr = jit->codeStart;
+	jit->coldPtr = jit->coldStart;
 	if (cpu->jitCurrentBlock) {
 		cpu->jitExitRequest = 1;
 	}
@@ -2033,6 +2061,14 @@ static void _thumbEmitInstruction(struct ARMJitInsnContext* ctx, uint16_t opcode
  * Block compilation
  * ------------------------------------------------------------------------- */
 
+static void _flushCache(struct ARMJit* jit, void* start, size_t size) {
+	if (jit->flushCache) {
+		jit->flushCache(start, size);
+	} else {
+		__builtin___clear_cache((char*) start, (char*) start + size);
+	}
+}
+
 static bool _isJittableRegion(uint32_t address) {
 	switch (address >> 24) {
 	case GBA_REGION_BIOS:
@@ -2127,7 +2163,8 @@ static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uin
 		maxInsns = (0x1000000 - (address & 0xFFFFFF)) / width - 2;
 	}
 
-	if (jit->nBlocks >= JIT_MAX_BLOCKS || (size_t) (jit->codeEnd - jit->codePtr) < JIT_MAX_BLOCK_WORDS) {
+	if (jit->nBlocks >= JIT_MAX_BLOCKS || (size_t) (jit->coldStart - jit->codePtr) < JIT_MAX_BLOCK_WORDS ||
+	    (size_t) (jit->codeEnd - jit->coldPtr) < JIT_MAX_BLOCK_WORDS) {
 #ifdef JITDBG
 		{ unsigned i, dead = 0; for (i = 0; i < jit->nBlocks; ++i) dead += jit->blocks[i].dead;
 		_dbgDump();
@@ -2148,6 +2185,9 @@ static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uin
 	e->start = jit->codePtr;
 	e->ptr = jit->codePtr;
 	e->end = jit->codePtr + JIT_MAX_BLOCK_WORDS;
+	e->otherPtr = jit->coldPtr;
+	e->otherEnd = jit->coldPtr + JIT_MAX_BLOCK_WORDS;
+	e->cold = false;
 
 	// Header: host code pointer, guest address, constant pool
 	uint32_t* header = e->ptr;
@@ -2232,6 +2272,7 @@ static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uin
 	uint32_t* dbgTail = e->ptr;
 #endif
 	// Out-of-line pieces
+	_setCold(e, true);
 	for (f = 0; f < e->nDeferred && !e->overflow; ++f) {
 		ctx.index = e->deferred[f].index;
 		_patchBranch(e->deferred[f].site, e->ptr);
@@ -2310,6 +2351,7 @@ static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uin
 #ifdef JITDBG
 	dbgTailWords += e->ptr - dbgTail;
 #endif
+	_setCold(e, false);
 
 	if (e->overflow || !i) {
 		return NULL;
@@ -2322,12 +2364,13 @@ static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uin
 		return NULL;
 	}
 
+#ifdef JITLOG
+	fprintf(stderr, "BLK %08X %d %u %u %u\n", address, thumb, i, (unsigned) (e->ptr - e->start), (unsigned) (e->otherPtr - jit->coldPtr));
+#endif
+	_flushCache(jit, e->start, (size_t) (e->ptr - e->start) * 4);
+	_flushCache(jit, jit->coldPtr, (size_t) (e->otherPtr - jit->coldPtr) * 4);
 	jit->codePtr = e->ptr;
-	if (jit->flushCache) {
-		jit->flushCache(e->start, (size_t) (e->ptr - e->start) * 4);
-	} else {
-		__builtin___clear_cache((char*) e->start, (char*) e->ptr);
-	}
+	jit->coldPtr = e->otherPtr;
 
 	unsigned h = _hash(address, thumb);
 	block->nextInHash = jit->hash[h];
@@ -2355,7 +2398,7 @@ bool ARMJitInit(struct ARMCore* cpu, void* execMemory, size_t size, ARMJitCacheF
 	if (cpu->jit) {
 		ARMJitDeinit(cpu);
 	}
-	if (!execMemory || size < (JIT_TRAMPOLINE_WORDS + 2 * JIT_MAX_BLOCK_WORDS) * 4) {
+	if (!execMemory || size < (JIT_TRAMPOLINE_WORDS + 6 * JIT_MAX_BLOCK_WORDS) * 4) {
 		return false;
 	}
 	struct ARMJit* jit = calloc(1, sizeof(*jit));
@@ -2400,6 +2443,8 @@ bool ARMJitInit(struct ARMCore* cpu, void* execMemory, size_t size, ARMJitCacheF
 	jit->codeStart = jit->mem + JIT_TRAMPOLINE_WORDS;
 	jit->codePtr = jit->codeStart;
 	jit->codeEnd = jit->mem + jit->memWords;
+	jit->coldStart = jit->codeStart + (jit->codeEnd - jit->codeStart) * JIT_HOT_PERCENT / 100;
+	jit->coldPtr = jit->coldStart;
 	jit->enabled = true;
 
 	cpu->jit = jit;
@@ -2433,14 +2478,6 @@ bool ARMJitIsEnabled(struct ARMCore* cpu) {
 void ARMJitFlush(struct ARMCore* cpu) {
 	if (cpu->jit) {
 		_flush(cpu->jit, cpu);
-	}
-}
-
-static void _flushCache(struct ARMJit* jit, void* start, size_t size) {
-	if (jit->flushCache) {
-		jit->flushCache(start, size);
-	} else {
-		__builtin___clear_cache((char*) start, (char*) start + size);
 	}
 }
 
@@ -2526,7 +2563,13 @@ void ARMJitInvalidateWrite(struct ARMCore* cpu, unsigned offset) {
 }
 
 const struct ARMJitStats* ARMJitGetStats(struct ARMCore* cpu) {
-	return cpu->jit ? &cpu->jit->stats : NULL;
+	struct ARMJit* jit = cpu->jit;
+	if (!jit) {
+		return NULL;
+	}
+	jit->stats.hotBytes = (uint32_t) ((jit->codePtr - jit->codeStart) * 4);
+	jit->stats.coldBytes = (uint32_t) ((jit->coldPtr - jit->coldStart) * 4);
+	return &jit->stats;
 }
 
 static bool _prefetchMatches(const struct ARMCore* cpu, const struct ARMJitBlock* block) {

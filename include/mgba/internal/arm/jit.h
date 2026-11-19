@@ -26,6 +26,8 @@ struct ARMJitStats {
 	uint64_t compileFailures;
 	uint64_t prefetchMismatches;
 	uint32_t lastFailAddress;
+	uint32_t hotBytes; // translated code in use: block bodies
+	uint32_t coldBytes; // and their out-of-line parts
 };
 
 /* The JIT is only usable when mGBA itself runs on a 32-bit ARM host. */
