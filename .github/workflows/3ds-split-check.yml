@@ -1,0 +1,101 @@
+name: 3DS split build check
+on:
+  push:
+    branches: [ci/3ds-split-check]
+permissions:
+  contents: write
+jobs:
+  build-3ds:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkitarm:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {n: 01, sha: 7e44c793615c1d7c61b17eaec45ab78f72260a9b}
+          - {n: 02, sha: 92682abcb5667e67ae30ab6b3b0e4351d2fb57c0}
+          - {n: 03, sha: f8b7718e1332e7fcdea0dfc1f2e6a7fd58642b4d}
+          - {n: 04, sha: 5f21797307d9d67dacb3c7891988b31bb48e89a2}
+          - {n: 05, sha: d3004e83d0045b5db1fb41f907e2108005622bd2}
+          - {n: 06, sha: 87a24bac8a94dc07baaabf824a2ff210d02d60c8}
+          - {n: 07, sha: 123c916b7e760a1b8f7ffe1e4b3b180ba2e7aae7}
+          - {n: 08, sha: aced30f8e995091b21ada4d3dd7686bb32fa4850}
+          - {n: 09, sha: 4ed9d4b4ca6fd909c66c950d8c6bdb0caca6c7bf}
+          - {n: 10, sha: 2c0d3d8c7f42dafe16d2288b955096186860cf02}
+          - {n: 11, sha: c684675ca59e73f0d410b6e137453b3b10ed06df}
+          - {n: 12, sha: e1bc0fd8040de724c43136f41c3ce1c3815701f3}
+          - {n: 13, sha: d3d53163a5624a0decfb12d5dc81f8f739e1148b}
+          - {n: 14, sha: 786789a4258f37e6f933bf37c2bbac12061cf075}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.sha }}
+      - name: Build 3DS (mgba.elf)
+        id: b3ds
+        continue-on-error: true
+        run: |
+          mkdir build && cd build
+          cmake .. -DCMAKE_TOOLCHAIN_FILE=../src/platform/3ds/CMakeToolchain.txt -DCMAKE_BUILD_TYPE=Release > ../cmake.log 2>&1 || (tail -40 ../cmake.log; exit 1)
+          make -j4 mgba.elf 2>&1 | tee ../make.log | grep -E 'error|warning: .*jit' | head -40
+          test -f src/platform/3ds/mgba.elf || test -f mgba.elf || find . -name 'mgba.elf' | grep -q .
+      - name: Build PC library (no dynarec on x86)
+        id: bpc
+        continue-on-error: true
+        run: |
+          apt-get update -qq >/dev/null 2>&1 || true
+          mkdir buildpc && cd buildpc
+          cmake .. -DCMAKE_TOOLCHAIN_FILE= -DCMAKE_C_COMPILER=gcc -DBUILD_QT=OFF -DBUILD_SDL=OFF -DBUILD_GL=OFF -DBUILD_GLES2=OFF -DBUILD_GLES3=OFF -DUSE_FFMPEG=OFF -DUSE_ZLIB=OFF -DUSE_MINIZIP=OFF -DUSE_LIBZIP=OFF -DUSE_PNG=OFF -DUSE_SQLITE3=OFF -DUSE_ELF=OFF -DUSE_LUA=OFF -DUSE_JSON_C=OFF -DUSE_EDITLINE=OFF -DUSE_EPOXY=OFF -DUSE_DISCORD_RPC=OFF -DBUILD_SHARED=OFF -DBUILD_STATIC=ON -DSKIP_LIBRARY=OFF > ../cmakepc.log 2>&1 || (tail -30 ../cmakepc.log; exit 1)
+          make -j4 2>&1 | tee ../makepc.log | grep -E ' error' | head -20
+          test ${PIPESTATUS[0]} -eq 0
+      - name: Record
+        if: always()
+        run: |
+          mkdir -p out
+          echo "${{ matrix.n }} ${{ matrix.sha }} 3ds=${{ steps.b3ds.outcome }} pc=${{ steps.bpc.outcome }} $(git log -1 --format=%s)" > out/r${{ matrix.n }}.txt
+          grep -E 'error|warning:' make.log 2>/dev/null | grep -v '^make' | head -30 >> out/r${{ matrix.n }}.txt || true
+          grep -E ' error|error:' makepc.log 2>/dev/null | head -20 >> out/r${{ matrix.n }}.txt || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: r${{ matrix.n }}
+          path: out/
+  libretro-3ds:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkitarm:latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 786789a4258f37e6f933bf37c2bbac12061cf075
+      - name: Build libretro static core for 3DS
+        id: lr
+        continue-on-error: true
+        run: |
+          mkdir build && cd build
+          cmake .. -DCMAKE_TOOLCHAIN_FILE=../src/platform/3ds/CMakeToolchain.txt -DBUILD_LIBRETRO=ON -DLIBRETRO_STATIC=ON -DCMAKE_BUILD_TYPE=Release > ../cmake.log 2>&1 || (tail -40 ../cmake.log; exit 1)
+          make -j4 mgba_libretro 2>&1 | tee ../make.log | grep -E 'error' | head -20
+          find . -name '*libretro*.a' | grep -q .
+      - name: Record
+        if: always()
+        run: |
+          mkdir -p out; echo "libretro ${{ steps.lr.outcome }}" > out/libretro.txt; grep -E 'error' make.log 2>/dev/null | head -20 >> out/libretro.txt || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: libretro
+          path: out/
+  report:
+    needs: [build-3ds, libretro-3ds]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: res
+          merge-multiple: true
+      - name: Push results
+        run: |
+          cat res/r*.txt res/libretro.txt > results.txt || true
+          cat results.txt
+          git init -q pub && cd pub && cp ../results.txt . && git add results.txt
+          git -c user.name=ci -c user.email=ci@localhost commit -qm "split build results ${{ github.sha }}"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" HEAD:refs/heads/ci/3ds-split-results
