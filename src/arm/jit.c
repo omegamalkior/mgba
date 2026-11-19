@@ -55,7 +55,7 @@
 #define JIT_HASH_BITS 14
 #define JIT_HASH_SIZE (1 << JIT_HASH_BITS)
 #define JIT_MAX_BLOCKS 0x4000
-#define JIT_MAX_LINKS 0x8000
+#define JIT_MAX_LINKS 0x20000
 #define JIT_MAX_CONSTS 256
 #define JIT_MAX_BLOCK_WORDS 0x2000
 #define JIT_TRAMPOLINE_WORDS 64
@@ -110,6 +110,8 @@ struct ARMJitBlock {
 	uint8_t dead;
 	uint8_t ram;
 	uint16_t length;
+	uint32_t ramStart; // byte range in the combined EWRAM+IWRAM buffer (RAM blocks)
+	uint32_t ramEnd;
 	const uint8_t* hostCode;
 	const uint32_t* entry;
 	struct ARMJitBlock* nextInHash;
@@ -512,6 +514,8 @@ static bool _registerPages(struct ARMJit* jit, struct ARMJitBlock* block, uint32
 	if (start < 0) {
 		return true;
 	}
+	block->ramStart = (uint32_t) start;
+	block->ramEnd = (uint32_t) start + bytes;
 	unsigned first = (unsigned) start >> ARM_JIT_PAGE_SHIFT;
 	unsigned last = (unsigned) (start + bytes - 1) >> ARM_JIT_PAGE_SHIFT;
 	unsigned page;
@@ -776,7 +780,7 @@ static uint32_t* _emitFastRam(struct ARMJitInsnContext* ctx, const struct ARMJit
 		}
 		// Stores to pages with translated code go through the interpreter
 		_loadConst(e, R12, (uint32_t) (uintptr_t) ctx->jit->pages);
-		_memReg(e, 0x07D00000, R12, R12, R3, SHIFT_LSR, 8); // ldrb r12, [r12, r3, lsr #8]
+		_memReg(e, 0x07D00000, R12, R12, R3, SHIFT_LSR, ARM_JIT_PAGE_SHIFT); // ldrb r12, [r12, r3, lsr #PAGE_SHIFT]
 		_dpImm(e, COND_AL, ALU_CMP, true, 0, R12, 0);
 		slowC = _bPlaceholder(e, COND_NE);
 	}
@@ -1074,11 +1078,11 @@ static void _emitFastMultiple(struct ARMJitInsnContext* ctx, bool load, unsigned
 	slow[2] = _bPlaceholder(e, 0x8); // HI
 	if (!load) {
 		_loadConst(e, R12, (uint32_t) (uintptr_t) ctx->jit->pages);
-		_memReg(e, 0x07D00000, R1, R12, R3, SHIFT_LSR, 8); // ldrb r1, [r12, r3, lsr #8]
+		_memReg(e, 0x07D00000, R1, R12, R3, SHIFT_LSR, ARM_JIT_PAGE_SHIFT); // ldrb r1, [r12, r3, lsr #PAGE_SHIFT]
 		_dpImm(e, COND_AL, ALU_CMP, true, 0, R1, 0);
 		slow[3] = _bPlaceholder(e, COND_NE);
 		_addImm(e, R1, R3, 4 * count - 4);
-		_memReg(e, 0x07D00000, R1, R12, R1, SHIFT_LSR, 8);
+		_memReg(e, 0x07D00000, R1, R12, R1, SHIFT_LSR, ARM_JIT_PAGE_SHIFT);
 		_dpImm(e, COND_AL, ALU_CMP, true, 0, R1, 0);
 		slow[4] = _bPlaceholder(e, COND_NE);
 	}
@@ -2135,15 +2139,24 @@ static void _chain(struct ARMJit* jit, uint32_t* slot, struct ARMJitBlock* targe
 	_flushCache(jit, slot, 4);
 }
 
-void ARMJitInvalidatePage(struct ARMCore* cpu, unsigned page) {
+void ARMJitInvalidateWrite(struct ARMCore* cpu, unsigned offset) {
 	struct ARMJit* jit = cpu->jit;
+	unsigned page = offset >> ARM_JIT_PAGE_SHIFT;
 	if (!jit || page >= ARM_JIT_RAM_PAGES) {
 		return;
 	}
-	struct ARMJitPageLink* link = jit->pageHead[page];
-	while (link) {
+	/* Only blocks whose guest code overlaps the written word are stale. Games
+	 * often keep variables right next to code in RAM (Metroid Fusion has a
+	 * frame counter just before its interrupt handler), and throwing away
+	 * every block in the page on such writes means recompiling every frame. */
+	uint32_t lo = offset & ~3u;
+	uint32_t hi = lo + 4;
+	struct ARMJitPageLink** linkp = &jit->pageHead[page];
+	bool live = false;
+	while (*linkp) {
+		struct ARMJitPageLink* link = *linkp;
 		struct ARMJitBlock* block = link->block;
-		if (!block->dead) {
+		if (!block->dead && block->ramStart < hi && lo < block->ramEnd) {
 			block->dead = 1;
 			_unlinkFromHash(jit, block);
 			_unchain(jit, block);
@@ -2152,10 +2165,14 @@ void ARMJitInvalidatePage(struct ARMCore* cpu, unsigned page) {
 			}
 			++jit->stats.invalidations;
 		}
-		link = link->next;
+		if (block->dead) {
+			*linkp = link->next; // drop links to dead blocks
+			continue;
+		}
+		live = true;
+		linkp = &link->next;
 	}
-	jit->pageHead[page] = NULL;
-	jit->pages[page] = 0;
+	jit->pages[page] = live;
 }
 
 const struct ARMJitStats* ARMJitGetStats(struct ARMCore* cpu) {
@@ -2243,9 +2260,9 @@ void ARMJitFlush(struct ARMCore* cpu) {
 	UNUSED(cpu);
 }
 
-void ARMJitInvalidatePage(struct ARMCore* cpu, unsigned page) {
+void ARMJitInvalidateWrite(struct ARMCore* cpu, unsigned offset) {
 	UNUSED(cpu);
-	UNUSED(page);
+	UNUSED(offset);
 }
 
 void ARMJitRunLoop(struct ARMCore* cpu) {
