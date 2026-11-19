@@ -219,6 +219,8 @@ struct ARMJitEmitter {
 	uint32_t* otherEnd;
 	bool cold;
 	bool overflow;
+	/* Where the guest NZCV flags are right now (see _flagsNeedHost etc.) */
+	int flags;
 	uint32_t consts[JIT_MAX_CONSTS];
 	unsigned nConsts;
 	struct {
@@ -252,6 +254,7 @@ struct ARMJitEmitter {
 		unsigned guestReg;
 		int writebackReg;
 		int32_t writebackDelta;
+		unsigned rewind; // r6 charges to take back: instructions of the run not executed
 	} deferred[JIT_MAX_ARM_INSNS + JIT_MAX_THUMB_INSNS];
 	unsigned nDeferred;
 	/* Set while classifying instructions on a scratch emitter */
@@ -362,6 +365,44 @@ static void _mrsFlags(struct ARMJitEmitter* e, unsigned rd) {
 
 static void _msrFlags(struct ARMJitEmitter* e, unsigned rm) {
 	_emit(e, 0xE128F000 | rm);
+}
+
+/* Guest flags live in r8 at block entry and wherever code leaves the straight
+ * line (exits, calls, stubs). In between they may stay in the host flags, so
+ * that runs of flag-setting instructions don't save and restore them each
+ * time. FLAGS_R8: only r8 is valid. FLAGS_HOST: only the host flags are.
+ * FLAGS_BOTH: both. */
+enum {
+	FLAGS_R8 = 0,
+	FLAGS_BOTH,
+	FLAGS_HOST
+};
+
+/* The next instruction reads the host flags, or keeps some of them */
+static void _flagsNeedHost(struct ARMJitEmitter* e) {
+	if (e->flags == FLAGS_R8) {
+		_msrFlags(e, R8);
+		e->flags = FLAGS_BOTH;
+	}
+}
+
+/* The last instruction left the guest flags in the host flags */
+static void _flagsWritten(struct ARMJitEmitter* e) {
+	e->flags = FLAGS_HOST;
+}
+
+/* r8 is about to be read (or code may leave the block) */
+static void _flagsToR8(struct ARMJitEmitter* e) {
+	if (e->flags == FLAGS_HOST) {
+		_mrsFlags(e, R8);
+		e->flags = FLAGS_BOTH;
+	}
+}
+
+/* The host flags are about to be overwritten by something else */
+static void _flagsClobber(struct ARMJitEmitter* e) {
+	_flagsToR8(e);
+	e->flags = FLAGS_R8;
 }
 
 static void _blx(struct ARMJitEmitter* e, unsigned rm) {
@@ -888,6 +929,7 @@ static void _cyclesAndCheck(struct ARMJitInsnContext* ctx) {
 	struct ARMJitEmitter* e = ctx->e;
 	e->sawOther = true;
 	e->segSkip = 0;
+	_flagsClobber(e);
 	_dpReg(e, COND_AL, ALU_ADD, false, R5, R5, R6, SHIFT_LSL, 0);
 	_dpReg(e, COND_AL, ALU_CMP, true, 0, R5, R7, SHIFT_LSL, 0);
 	if (e->nStubFixups < sizeof(e->stubFixups) / sizeof(e->stubFixups[0])) {
@@ -903,6 +945,7 @@ static void _eventCheckOnly(struct ARMJitInsnContext* ctx) {
 	struct ARMJitEmitter* e = ctx->e;
 	e->sawOther = true;
 	e->segSkip = 0;
+	_flagsClobber(e);
 	_dpReg(e, COND_AL, ALU_CMP, true, 0, R5, R7, SHIFT_LSL, 0);
 	if (e->nStubFixups < sizeof(e->stubFixups) / sizeof(e->stubFixups[0])) {
 		e->stubFixups[e->nStubFixups].site = _bPlaceholder(e, COND_GE);
@@ -918,7 +961,7 @@ static void _eventCheckOnly(struct ARMJitInsnContext* ctx) {
 static void _nativeCycles(struct ARMJitInsnContext* ctx) {
 	struct ARMJitEmitter* e = ctx->e;
 	if (e->segSkip) {
-		_dpReg(e, COND_AL, ALU_ADD, false, R5, R5, R6, SHIFT_LSL, 0);
+		// The run's check already charged this instruction's r6
 		e->sawNative = true;
 		return;
 	}
@@ -945,6 +988,7 @@ static void _emitChainSlot(struct ARMJitInsnContext* ctx, uint32_t target, int32
 	struct ARMJitEmitter* e = ctx->e;
 	e->sawOther = true;
 	e->segSkip = 0;
+	_flagsClobber(e);
 	if (e->nSlots >= JIT_MAX_SLOTS) {
 		if (pcAfter < 0) {
 			_b(e, COND_AL, ctx->jit->exitPlain);
@@ -966,6 +1010,7 @@ static void _emitChainSlot(struct ARMJitInsnContext* ctx, uint32_t target, int32
 static void _emitIndirectExit(struct ARMJitInsnContext* ctx) {
 	struct ARMJitEmitter* e = ctx->e;
 	struct ARMJit* jit = ctx->jit;
+	_flagsClobber(e);
 	_dpReg(e, COND_AL, ALU_CMP, true, 0, R5, R7, SHIFT_LSL, 0);
 	_b(e, COND_GE, jit->exitPlain);
 	_ldr(e, R0, R4, offsetof(struct ARMCore, gprs) + 4 * ARM_PC);
@@ -1007,10 +1052,13 @@ static void _emitHelperCall(struct ARMJitInsnContext* ctx, unsigned cond, uintpt
 		_cyclesAndCheck(ctx);
 		return;
 	}
+	_flagsToR8(e);
 	if (cond != COND_AL) {
-		_msrFlags(e, R8);
+		_flagsNeedHost(e);
 		skip = _bPlaceholder(e, cond ^ 1);
 	}
+	// The handler gets the flags from r8 and r8 is reloaded after it
+	e->flags = FLAGS_R8;
 
 	if (chain == CHAIN_NONE && !branchClass) {
 		// Common case: one call into the shared stub
@@ -1130,6 +1178,7 @@ static void _emitMemoryWithFallback(struct ARMJitInsnContext* ctx, const struct 
 		e->overflow = true;
 		return;
 	}
+	_flagsClobber(e);
 	if (m->store) {
 		_loadGuestReg(ctx, R1, m->guestReg, 0);
 	}
@@ -1271,6 +1320,7 @@ static void _emitFastMultiple(struct ARMJitInsnContext* ctx, bool load, unsigned
 	}
 	uint32_t* slow[6] = {0};
 
+	_flagsClobber(e);
 	_loadGuestReg(ctx, R0, rn, 0);
 	if (start) {
 		_addImm(e, R0, R0, start);
@@ -1631,9 +1681,12 @@ static void _armEmitDataProcessing(struct ARMJitInsnContext* ctx, uint32_t opcod
 	}
 
 	if (readsFlags) {
-		_msrFlags(e, R8);
+		_flagsNeedHost(e);
 	}
 	if (cond != COND_AL) {
+		// Both ways through a conditional instruction must agree on where the
+		// flags are afterwards: in r8 and, when nothing disturbs them, the host
+		_flagsToR8(e);
 		skip = _bPlaceholder(e, cond ^ 1);
 	}
 	if (regShift) {
@@ -1681,21 +1734,23 @@ static void _armEmitDataProcessing(struct ARMJitInsnContext* ctx, uint32_t opcod
 	}
 	switch (carryKind) {
 	case CARRY_FROM_FLAGS_BEFORE:
+		_flagsToR8(e);
 		_dpReg(e, COND_AL, ALU_MOV, false, R3, 0, R8, SHIFT_ROR, 29);
 		break;
 	case CARRY_CONSTANT:
 		_dpImm(e, COND_AL, ALU_MOV, false, R3, 0, carryConstant);
 		break;
 	case CARRY_COMPUTED:
-		if (!readsFlags) {
-			_msrFlags(e, R8);
-		}
+		// A shift by zero passes the guest C through, so MOVS needs the flags
+		_flagsNeedHost(e);
+		_flagsToR8(e);
 		// MOVS r3, operand2: host C becomes the shifter carry-out
 		_emit(e, (COND_AL << 28) | (ALU_MOV << 21) | (1 << 20) | (R3 << 12) | operand2);
 		_mrsFlags(e, R3);
 		_dpReg(e, COND_AL, ALU_MOV, false, R3, 0, R3, SHIFT_ROR, 29);
+		e->flags = FLAGS_R8;
 		if (readsFlags) {
-			_msrFlags(e, R8);
+			_flagsNeedHost(e);
 		}
 		break;
 	case CARRY_FROM_RESULT_FLAGS:
@@ -1708,13 +1763,17 @@ static void _armEmitDataProcessing(struct ARMJitInsnContext* ctx, uint32_t opcod
 		_storeGuestReg(ctx, R0, rd);
 	}
 	if (s) {
-		_mrsFlags(e, R8);
+		_flagsWritten(e);
 	}
 	if (carryKind == CARRY_FROM_RESULT_FLAGS) {
+		_flagsToR8(e);
 		_dpReg(e, COND_AL, ALU_MOV, false, R3, 0, R8, SHIFT_ROR, 29);
 	}
 	_str(e, R3, R4, ctx->jit->offShifterCarry);
 	if (skip) {
+		// Skipped: r8 and the host flags both hold the flags. Match that if
+		// possible, else fall back to r8 only.
+		_flagsToR8(e);
 		_patchBranch(skip, e->ptr);
 	}
 	_nativeCycles(ctx);
@@ -1778,7 +1837,7 @@ static bool _thumbIsBranchClass(uint16_t opcode) {
 
 static void _thumbEmitNative(struct ARMJitInsnContext* ctx, bool msrFirst, bool extraCycle) {
 	if (msrFirst) {
-		_msrFlags(ctx->e, R8);
+		_flagsNeedHost(ctx->e);
 	}
 	if (extraCycle) {
 		_dpImm(ctx->e, COND_AL, ALU_ADD, false, R5, R5, 1);
@@ -1801,7 +1860,7 @@ static bool _thumbEmitNativeInstruction(struct ARMJitInsnContext* ctx, uint16_t 
 			_loadGuestReg(ctx, R1, rs, 0);
 			_dpReg(e, COND_AL, ALU_MOV, true, R0, 0, R1, op, imm);
 			_storeGuestReg(ctx, R0, rd);
-			_mrsFlags(e, R8);
+			_flagsWritten(e);
 			_nativeCycles(ctx);
 			return true;
 		}
@@ -1817,7 +1876,7 @@ static bool _thumbEmitNativeInstruction(struct ARMJitInsnContext* ctx, uint16_t 
 			_dpReg(e, COND_AL, alu, true, R0, R0, R1, SHIFT_LSL, 0);
 		}
 		_storeGuestReg(ctx, R0, rd);
-		_mrsFlags(e, R8);
+		_flagsWritten(e);
 		_nativeCycles(ctx);
 		return true;
 	}
@@ -1847,7 +1906,7 @@ static bool _thumbEmitNativeInstruction(struct ARMJitInsnContext* ctx, uint16_t 
 			_storeGuestReg(ctx, R0, reg);
 			break;
 		}
-		_mrsFlags(e, R8);
+		_flagsWritten(e);
 		_nativeCycles(ctx);
 		return true;
 	}
@@ -1921,7 +1980,7 @@ static bool _thumbEmitNativeInstruction(struct ARMJitInsnContext* ctx, uint16_t 
 				_storeGuestReg(ctx, R0, rd);
 				break;
 			}
-			_mrsFlags(e, R8);
+			_flagsWritten(e);
 			_nativeCycles(ctx);
 			return true;
 		}
@@ -1945,7 +2004,7 @@ static bool _thumbEmitNativeInstruction(struct ARMJitInsnContext* ctx, uint16_t 
 				_loadGuestReg(ctx, R0, hd, 0);
 				_loadGuestReg(ctx, R1, hm, 0);
 				_dpReg(e, COND_AL, ALU_CMP, true, 0, R0, R1, SHIFT_LSL, 0);
-				_mrsFlags(e, R8);
+				_flagsWritten(e);
 				_nativeCycles(ctx);
 				return true;
 			case 2: // MOV
@@ -2031,8 +2090,10 @@ static void _thumbEmitInstruction(struct ARMJitInsnContext* ctx, uint16_t opcode
 			e->overflow = true;
 			return;
 		}
-		_msrFlags(e, R8);
+		_flagsNeedHost(e);
+		_flagsToR8(e); // the taken path leaves the block
 		uint32_t* taken = _bPlaceholder(e, (opcode >> 8) & 0xF);
+		e->deferred[e->nDeferred].rewind = e->segSkip;
 		_nativeCycles(ctx);
 		e->deferred[e->nDeferred].site = taken;
 		e->deferred[e->nDeferred].back = e->ptr;
@@ -2089,6 +2150,7 @@ static bool _isJittableRegion(uint32_t address) {
 
 static void _resetEmitter(struct ARMJitEmitter* e) {
 	e->overflow = false;
+	e->flags = FLAGS_R8;
 	e->nConsts = 0;
 	e->nStubFixups = 0;
 	e->nSlots = 0;
@@ -2276,20 +2338,21 @@ static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uin
 			 * reach the next event, only the last one needs an event check.
 			 * Each costs at most r6 + 1, so check r5 + (N-1)(r6+1) < r7 once
 			 * here; otherwise leave and let the interpreter step through the
-			 * run, which is exactly what the per-instruction checks would do. */
+			 * run, which is exactly what the per-instruction checks would do.
+			 * Once the check passes, their r6 cycles are charged in one go. */
 			unsigned run = _scanNative(&ctx, i, maxInsns, scratch, scratchBuffer, JIT_SCRATCH_WORDS);
-			if (run >= 3) {
+			if (run >= 3 && e->nBails < sizeof(e->bails) / sizeof(e->bails[0])) {
 				unsigned covered = run - 1;
+				_flagsClobber(e);
 				_dpImm(e, COND_AL, ALU_MOV, false, R3, 0, covered);
 				_emit(e, 0xE0200090 | (R12 << 16) | (R5 << 12) | (R6 << 8) | R3); // mla r12, r3, r6, r5
 				_dpImm(e, COND_AL, ALU_ADD, false, R12, R12, covered);
 				_dpReg(e, COND_AL, ALU_CMP, true, 0, R12, R7, SHIFT_LSL, 0);
-				if (e->nBails < sizeof(e->bails) / sizeof(e->bails[0])) {
-					e->bails[e->nBails].site = _bPlaceholder(e, COND_GE);
-					e->bails[e->nBails].pcBefore = thumb ? (int32_t) (i * 2 + 2) : (int32_t) (i * 4 + 4);
-					++e->nBails;
-					e->segSkip = covered;
-				}
+				e->bails[e->nBails].site = _bPlaceholder(e, COND_GE);
+				e->bails[e->nBails].pcBefore = thumb ? (int32_t) (i * 2 + 2) : (int32_t) (i * 4 + 4);
+				++e->nBails;
+				e->segSkip = covered;
+				_dpImm(e, COND_AL, ALU_SUB, false, R5, R12, covered);
 			}
 		}
 		bool skipping = e->segSkip > 0;
@@ -2330,9 +2393,19 @@ static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uin
 	for (f = 0; f < e->nDeferred && !e->overflow; ++f) {
 		ctx.index = e->deferred[f].index;
 		_patchBranch(e->deferred[f].site, e->ptr);
+		e->flags = FLAGS_R8;
 		if (e->deferred[f].kind == 0) {
-			// Taken conditional branch
+			// Taken conditional branch. Inside a run, the rest of the run was
+			// charged already; take that back.
+			unsigned rewind = e->deferred[f].rewind;
+			unsigned bit;
+			for (bit = 0; rewind >> bit; ++bit) {
+				if (rewind & (1u << bit)) {
+					_dpReg(e, COND_AL, ALU_SUB, false, R5, R5, R6, SHIFT_LSL, bit);
+				}
+			}
 			_emitHelperCall(&ctx, COND_AL, e->deferred[f].handler, false, CHAIN_IF_TAKEN, e->deferred[f].target);
+			_msrFlags(e, R8);
 			_b(e, COND_AL, e->deferred[f].back);
 			continue;
 		}
