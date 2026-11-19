@@ -8,6 +8,7 @@
 #include <mgba/internal/arm/isa-arm.h>
 #include <mgba/internal/arm/isa-inlines.h>
 #include <mgba/internal/arm/isa-thumb.h>
+#include <mgba/internal/arm/jit.h>
 
 void ARMSetPrivilegeMode(struct ARMCore* cpu, enum PrivilegeMode mode) {
 	if (mode == cpu->privilegeMode) {
@@ -56,6 +57,7 @@ void ARMInit(struct ARMCore* cpu) {
 }
 
 void ARMDeinit(struct ARMCore* cpu) {
+	ARMJitDeinit(cpu);
 	if (cpu->master->deinit) {
 		cpu->master->deinit(cpu->master);
 	}
@@ -117,6 +119,8 @@ void ARMReset(struct ARMCore* cpu) {
 	cpu->cycles = 0;
 	cpu->nextEvent = 0;
 	cpu->halted = 0;
+
+	ARM_JIT_FLUSH_IF_ACTIVE(cpu);
 
 	cpu->irqh.reset(cpu);
 }
@@ -240,7 +244,19 @@ void ARMRun(struct ARMCore* cpu) {
 	}
 }
 
+void ARMStepOne(struct ARMCore* cpu) {
+	if (cpu->executionMode == MODE_THUMB) {
+		ThumbStep(cpu);
+	} else {
+		ARMStep(cpu);
+	}
+}
+
 void ARMRunLoop(struct ARMCore* cpu) {
+	if (cpu->jit && ARMJitIsEnabled(cpu)) {
+		ARMJitRunLoop(cpu);
+		return;
+	}
 	if (cpu->executionMode == MODE_THUMB) {
 		while (cpu->cycles < cpu->nextEvent) {
 			ThumbStep(cpu);

@@ -193,6 +193,13 @@ struct ARMCore {
 
 	size_t numComponents;
 	struct mCPUComponent** components;
+
+	struct ARMJit* jit;
+	uint8_t* jitCodePages;
+	int32_t jitExitRequest;
+	void* jitCurrentBlock;
+	uint32_t* jitLastSlot;
+	uint32_t jitLastSlotTarget;
 };
 #undef ARM_REGISTER_FILE
 
@@ -211,6 +218,7 @@ void ARMRaiseUndefined(struct ARMCore*);
 void ARMRun(struct ARMCore* cpu);
 void ARMRunLoop(struct ARMCore* cpu);
 void ARMRunFake(struct ARMCore* cpu, uint32_t opcode);
+void ARMStepOne(struct ARMCore* cpu);
 
 CXX_GUARD_END
 
