@@ -1,0 +1,150 @@
+-- Test tools:
+-- 	Profiling: OFF
+-- 	Test harness: OFF
+-- 	Test suite: OFF
+-- 	Video test suite: OFF
+-- Cores:
+-- 	Libretro core: ON
+-- Libraries:
+-- 	Static: OFF
+-- 	Shared: OFF
+-- Configuring done (2.3s)
+-- Generating done (0.0s)
+-- Build files have been written to: /__w/mgba/mgba/core/b
+[  0%] Built target mgba-version-info
+[  2%] Building C object CMakeFiles/mgba_libretro.dir/src/core/cheats.c.obj
+[  2%] Building C object CMakeFiles/mgba_libretro.dir/src/core/bitmap-cache.c.obj
+[  2%] Building C object CMakeFiles/mgba_libretro.dir/src/core/cache-set.c.obj
+[  3%] Building C object CMakeFiles/mgba_libretro.dir/src/core/config.c.obj
+[  4%] Building C object CMakeFiles/mgba_libretro.dir/src/core/core.c.obj
+[  4%] Building C object CMakeFiles/mgba_libretro.dir/src/core/directories.c.obj
+[  5%] Building C object CMakeFiles/mgba_libretro.dir/src/core/interface.c.obj
+[  7%] Building C object CMakeFiles/mgba_libretro.dir/src/core/lockstep.c.obj
+[  8%] Building C object CMakeFiles/mgba_libretro.dir/src/core/log.c.obj
+[  8%] Building C object CMakeFiles/mgba_libretro.dir/src/core/map-cache.c.obj
+[  9%] Building C object CMakeFiles/mgba_libretro.dir/src/core/serialize.c.obj
+[ 10%] Building C object CMakeFiles/mgba_libretro.dir/src/core/sync.c.obj
+[ 10%] Building C object CMakeFiles/mgba_libretro.dir/src/core/thread.c.obj
+[ 11%] Building C object CMakeFiles/mgba_libretro.dir/src/core/tile-cache.c.obj
+[ 13%] Building C object CMakeFiles/mgba_libretro.dir/src/core/timing.c.obj
+[ 13%] Building C object CMakeFiles/mgba_libretro.dir/src/sm83/decoder.c.obj
+[ 14%] Building C object CMakeFiles/mgba_libretro.dir/src/sm83/isa-sm83.c.obj
+[ 15%] Building C object CMakeFiles/mgba_libretro.dir/src/sm83/sm83.c.obj
+[ 16%] Building C object CMakeFiles/mgba_libretro.dir/src/gb/audio.c.obj
+[ 16%] Building C object CMakeFiles/mgba_libretro.dir/src/gb/cheats.c.obj
+[ 17%] Building C object CMakeFiles/mgba_libretro.dir/src/gb/core.c.obj
+[ 19%] Building C object CMakeFiles/mgba_libretro.dir/src/gb/gb.c.obj
+[ 19%] Building C object CMakeFiles/mgba_libretro.dir/src/gb/input.c.obj
+[ 20%] Building C object CMakeFiles/mgba_libretro.dir/src/gb/io.c.obj
+[ 21%] Building C object CMakeFiles/mgba_libretro.dir/src/gb/mbc.c.obj
+/__w/mgba/mgba/core/src/gb/mbc.c: In function 'GBMBCSwitchSramHalfBank':
+/__w/mgba/mgba/core/src/gb/mbc.c:293:63: warning: comparison of integer expressions of different signedness: 'int' and 'uint32_t' {aka 'long unsigned int'} [-Wsign-compare]
+  293 |                 if (bankStart + GB_SIZE_EXTERNAL_RAM_HALFBANK > gb->sramSize) {
+      |                                                               ^
+[ 22%] Building C object CMakeFiles/mgba_libretro.dir/src/gb/mbc/huc-3.c.obj
+[ 22%] Building C object CMakeFiles/mgba_libretro.dir/src/gb/mbc/licensed.c.obj
+[ 23%] Building C object CMakeFiles/mgba_libretro.dir/src/gb/mbc/mbc.c.obj
+[ 25%] Building C object CMakeFiles/mgba_libretro.dir/src/gb/mbc/pocket-cam.c.obj
+[ 25%] Building C object CMakeFiles/mgba_libretro.dir/src/gb/mbc/tama5.c.obj
+[ 26%] Building C object CMakeFiles/mgba_libretro.dir/src/gb/mbc/unlicensed.c.obj
+[ 27%] Building C object CMakeFiles/mgba_libretro.dir/src/gb/memory.c.obj
+[ 27%] Building C object CMakeFiles/mgba_libretro.dir/src/gb/overrides.c.obj
+[ 28%] Building C object CMakeFiles/mgba_libretro.dir/src/gb/serialize.c.obj
+[ 29%] Building C object CMakeFiles/mgba_libretro.dir/src/gb/renderers/cache-set.c.obj
+[ 29%] Building C object CMakeFiles/mgba_libretro.dir/src/gb/renderers/software.c.obj
+[ 30%] Building C object CMakeFiles/mgba_libretro.dir/src/gb/sio.c.obj
+[ 32%] Building C object CMakeFiles/mgba_libretro.dir/src/gb/timer.c.obj
+[ 33%] Building C object CMakeFiles/mgba_libretro.dir/src/gb/video.c.obj
+[ 33%] Building C object CMakeFiles/mgba_libretro.dir/src/arm/arm.c.obj
+[ 34%] Building C object CMakeFiles/mgba_libretro.dir/src/arm/decoder-arm.c.obj
+[ 35%] Building C object CMakeFiles/mgba_libretro.dir/src/arm/decoder.c.obj
+[ 35%] Building C object CMakeFiles/mgba_libretro.dir/src/arm/decoder-thumb.c.obj
+[ 36%] Building C object CMakeFiles/mgba_libretro.dir/src/arm/isa-arm.c.obj
+[ 38%] Building C object CMakeFiles/mgba_libretro.dir/src/arm/isa-thumb.c.obj
+[ 38%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/audio.c.obj
+[ 39%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/bios.c.obj
+[ 40%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/cart/ereader.c.obj
+[ 41%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/cart/gpio.c.obj
+[ 41%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/cart/matrix.c.obj
+[ 42%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/cart/unlicensed.c.obj
+[ 44%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/cart/vfame.c.obj
+[ 45%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/cheats.c.obj
+[ 45%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/cheats/codebreaker.c.obj
+[ 46%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/cheats/gameshark.c.obj
+[ 46%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/cheats/parv3.c.obj
+[ 47%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/core.c.obj
+[ 48%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/dma.c.obj
+[ 50%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/gba.c.obj
+[ 50%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/hle-bios.c.obj
+[ 51%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/input.c.obj
+[ 52%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/io.c.obj
+[ 53%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/overrides.c.obj
+[ 53%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/memory.c.obj
+[ 54%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/renderers/cache-set.c.obj
+[ 54%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/renderers/common.c.obj
+[ 55%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/renderers/gl.c.obj
+[ 58%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/renderers/software-mode0.c.obj
+[ 58%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/renderers/software-bg.c.obj
+[ 58%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/renderers/software-obj.c.obj
+[ 59%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/renderers/video-software.c.obj
+[ 60%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/savedata.c.obj
+[ 60%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/serialize.c.obj
+[ 61%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/sharkport.c.obj
+[ 63%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/sio.c.obj
+[ 63%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/sio/gbp.c.obj
+[ 64%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/timer.c.obj
+[ 65%] Building C object CMakeFiles/mgba_libretro.dir/src/gba/video.c.obj
+[ 66%] Building C object CMakeFiles/mgba_libretro.dir/src/util/circle-buffer.c.obj
+[ 66%] Building C object CMakeFiles/mgba_libretro.dir/src/util/configuration.c.obj
+[ 67%] Building C object CMakeFiles/mgba_libretro.dir/src/util/crc32.c.obj
+[ 69%] Building C object CMakeFiles/mgba_libretro.dir/src/util/formatting.c.obj
+[ 69%] Building C object CMakeFiles/mgba_libretro.dir/src/util/gbk-table.c.obj
+[ 70%] Building C object CMakeFiles/mgba_libretro.dir/src/util/hash.c.obj
+[ 71%] Building C object CMakeFiles/mgba_libretro.dir/src/util/md5.c.obj
+[ 71%] Building C object CMakeFiles/mgba_libretro.dir/src/util/sha1.c.obj
+[ 72%] Building C object CMakeFiles/mgba_libretro.dir/src/util/string.c.obj
+[ 73%] Building C object CMakeFiles/mgba_libretro.dir/src/util/table.c.obj
+[ 75%] Building C object CMakeFiles/mgba_libretro.dir/src/util/vector.c.obj
+[ 75%] Building C object CMakeFiles/mgba_libretro.dir/src/util/vfs.c.obj
+[ 76%] Building C object CMakeFiles/mgba_libretro.dir/src/util/audio-buffer.c.obj
+[ 77%] Building C object CMakeFiles/mgba_libretro.dir/src/util/convolve.c.obj
+[ 77%] Building C object CMakeFiles/mgba_libretro.dir/src/util/elf-read.c.obj
+[ 78%] Building C object CMakeFiles/mgba_libretro.dir/src/util/geometry.c.obj
+[ 79%] Building C object CMakeFiles/mgba_libretro.dir/src/util/image.c.obj
+[ 79%] Building C object CMakeFiles/mgba_libretro.dir/src/util/image/export.c.obj
+[ 80%] Building C object CMakeFiles/mgba_libretro.dir/src/util/image/font.c.obj
+[ 82%] Building C object CMakeFiles/mgba_libretro.dir/src/util/image/png-io.c.obj
+[ 83%] Building C object CMakeFiles/mgba_libretro.dir/src/util/patch.c.obj
+[ 83%] Building C object CMakeFiles/mgba_libretro.dir/src/util/patch-fast.c.obj
+[ 84%] Building C object CMakeFiles/mgba_libretro.dir/src/util/patch-ips.c.obj
+[ 85%] Building C object CMakeFiles/mgba_libretro.dir/src/util/patch-ups.c.obj
+[ 85%] Building C object CMakeFiles/mgba_libretro.dir/src/util/ring-fifo.c.obj
+[ 86%] Building C object CMakeFiles/mgba_libretro.dir/src/util/sfo.c.obj
+[ 88%] Building C object CMakeFiles/mgba_libretro.dir/src/util/text-codec.c.obj
+[ 88%] Building C object CMakeFiles/mgba_libretro.dir/version.c.obj
+[ 89%] Building C object CMakeFiles/mgba_libretro.dir/src/util/vfs/vfs-mem.c.obj
+[ 90%] Building C object CMakeFiles/mgba_libretro.dir/src/util/vfs/vfs-fifo.c.obj
+[ 91%] Building C object CMakeFiles/mgba_libretro.dir/src/util/memory.c.obj
+[ 91%] Building C object CMakeFiles/mgba_libretro.dir/src/platform/3ds/3ds-vfs.c.obj
+[ 92%] Building C object CMakeFiles/mgba_libretro.dir/src/platform/3ds/ctru-heap.c.obj
+[ 94%] Building C object CMakeFiles/mgba_libretro.dir/src/platform/3ds/socket.c.obj
+[ 94%] Building C object CMakeFiles/mgba_libretro.dir/src/third-party/inih/ini.c.obj
+[ 95%] Building C object CMakeFiles/mgba_libretro.dir/src/util/vfs/vfs-fd.c.obj
+[ 96%] Building C object CMakeFiles/mgba_libretro.dir/src/util/vfs/vfs-dirent.c.obj
+[ 96%] Building C object CMakeFiles/mgba_libretro.dir/src/platform/libretro/libretro-audio.c.obj
+[ 97%] Building C object CMakeFiles/mgba_libretro.dir/src/platform/libretro/libretro-vfs.c.obj
+[ 98%] Building C object CMakeFiles/mgba_libretro.dir/src/platform/libretro/libretro.c.obj
+/__w/mgba/mgba/core/src/platform/libretro/libretro.c: In function '_audioRateChanged':
+/__w/mgba/mgba/core/src/platform/libretro/libretro.c:2408:66: warning: unused parameter 'rate' [-Wunused-parameter]
+ 2408 | static void _audioRateChanged(struct mAVStream* stream, unsigned rate) {
+      |                                                         ~~~~~~~~~^~~~
+/__w/mgba/mgba/core/src/platform/libretro/libretro.c: In function 'retro_get_memory_data':
+/__w/mgba/mgba/core/src/platform/libretro/libretro.c:2258:17: warning: this statement may fall through [-Wimplicit-fallthrough=]
+ 2258 |                 switch (core->platform(core)) {
+      |                 ^~~~~~
+/__w/mgba/mgba/core/src/platform/libretro/libretro.c:2271:9: note: here
+ 2271 |         case RETRO_MEMORY_SYSTEM_RAM:
+      |         ^~~~
+[100%] Linking C static library mgba_libretro.a
+[100%] Built target mgba_libretro
+core/b/mgba_libretro.a

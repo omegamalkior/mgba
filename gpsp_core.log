@@ -1,0 +1,150 @@
+      |                ^
+video.cc:690:16: warning: variable 'i' set but not used [-Wunused-but-set-variable=]
+  690 |       for (u32 i = 0; cnt; i++, cnt--) {
+      |                ^
+video.cc:725:16: warning: variable 'i' set but not used [-Wunused-but-set-variable=]
+  725 |       for (u32 i = 0; cnt; i++, cnt--) {
+      |                ^
+video.cc:763:18: warning: variable 'i' set but not used [-Wunused-but-set-variable=]
+  763 |         for (u32 i = 0; cnt; i++, cnt--) {
+      |                  ^
+video.cc: In instantiation of 'void render_affine_background(u32, u32, u32, const u8*, u32, const u8*, void*, const u16*) [with dtype = unsigned int; rendtype rdtype = STCKCOLOR; bool isbase = false; bool wrap = false; bool rotate = true; bool mosaic = false; u32 = unsigned int; u8 = unsigned char; u16 = short unsigned int]':
+video.cc:826:5:   required from 'void render_scanline_affine(u32, u32, u32, void*, const u16*) [with dsttype = unsigned int; rendtype rdtype = STCKCOLOR; bool isbase = false; u32 = unsigned int; u16 = short unsigned int]'
+  826 |     render_affine_background<dsttype, rdtype, isbase, false, true,  false>,
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+video.cc:1953:11:   required from 'void tile_render_layers(u32, u32, dsttype*, u32) [with rendtype bgmode = STCKCOLOR; rendtype objmode = STCKCOLOR; dsttype = unsigned int; u32 = unsigned int]'
+ 1953 |           render_scanline_affine<dsttype, bgmode, false>,
+      |           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+video.cc:2163:18:   required from here
+ 2163 |   .stacked     = tile_render_layers<STCKCOLOR, STCKCOLOR, u32>,
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+video.cc:669:16: warning: variable 'i' set but not used [-Wunused-but-set-variable=]
+  669 |       for (u32 i = 0; cnt; i++, cnt--) {
+      |                ^
+video.cc:690:16: warning: variable 'i' set but not used [-Wunused-but-set-variable=]
+  690 |       for (u32 i = 0; cnt; i++, cnt--) {
+      |                ^
+video.cc:725:16: warning: variable 'i' set but not used [-Wunused-but-set-variable=]
+  725 |       for (u32 i = 0; cnt; i++, cnt--) {
+      |                ^
+video.cc:763:18: warning: variable 'i' set but not used [-Wunused-but-set-variable=]
+  763 |         for (u32 i = 0; cnt; i++, cnt--) {
+      |                  ^
+video.cc: In instantiation of 'void render_affine_background(u32, u32, u32, const u8*, u32, const u8*, void*, const u16*) [with dtype = unsigned int; rendtype rdtype = STCKCOLOR; bool isbase = false; bool wrap = false; bool rotate = true; bool mosaic = true; u32 = unsigned int; u8 = unsigned char; u16 = short unsigned int]':
+video.cc:827:5:   required from 'void render_scanline_affine(u32, u32, u32, void*, const u16*) [with dsttype = unsigned int; rendtype rdtype = STCKCOLOR; bool isbase = false; u32 = unsigned int; u16 = short unsigned int]'
+  827 |     render_affine_background<dsttype, rdtype, isbase, false, true,  true>,
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+video.cc:1953:11:   required from 'void tile_render_layers(u32, u32, dsttype*, u32) [with rendtype bgmode = STCKCOLOR; rendtype objmode = STCKCOLOR; dsttype = unsigned int; u32 = unsigned int]'
+ 1953 |           render_scanline_affine<dsttype, bgmode, false>,
+      |           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+video.cc:2163:18:   required from here
+ 2163 |   .stacked     = tile_render_layers<STCKCOLOR, STCKCOLOR, u32>,
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+video.cc:669:16: warning: variable 'i' set but not used [-Wunused-but-set-variable=]
+  669 |       for (u32 i = 0; cnt; i++, cnt--) {
+      |                ^
+video.cc:690:16: warning: variable 'i' set but not used [-Wunused-but-set-variable=]
+  690 |       for (u32 i = 0; cnt; i++, cnt--) {
+      |                ^
+video.cc:725:16: warning: variable 'i' set but not used [-Wunused-but-set-variable=]
+  725 |       for (u32 i = 0; cnt; i++, cnt--) {
+      |                ^
+video.cc:763:18: warning: variable 'i' set but not used [-Wunused-but-set-variable=]
+  763 |         for (u32 i = 0; cnt; i++, cnt--) {
+      |                  ^
+video.cc: In instantiation of 'void render_affine_background(u32, u32, u32, const u8*, u32, const u8*, void*, const u16*) [with dtype = unsigned int; rendtype rdtype = STCKCOLOR; bool isbase = false; bool wrap = true; bool rotate = false; bool mosaic = false; u32 = unsigned int; u8 = unsigned char; u16 = short unsigned int]':
+video.cc:828:5:   required from 'void render_scanline_affine(u32, u32, u32, void*, const u16*) [with dsttype = unsigned int; rendtype rdtype = STCKCOLOR; bool isbase = false; u32 = unsigned int; u16 = short unsigned int]'
+  828 |     render_affine_background<dsttype, rdtype, isbase, true,  false, false>,
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+video.cc:1953:11:   required from 'void tile_render_layers(u32, u32, dsttype*, u32) [with rendtype bgmode = STCKCOLOR; rendtype objmode = STCKCOLOR; dsttype = unsigned int; u32 = unsigned int]'
+ 1953 |           render_scanline_affine<dsttype, bgmode, false>,
+      |           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+video.cc:2163:18:   required from here
+ 2163 |   .stacked     = tile_render_layers<STCKCOLOR, STCKCOLOR, u32>,
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+video.cc:669:16: warning: variable 'i' set but not used [-Wunused-but-set-variable=]
+  669 |       for (u32 i = 0; cnt; i++, cnt--) {
+      |                ^
+video.cc:690:16: warning: variable 'i' set but not used [-Wunused-but-set-variable=]
+  690 |       for (u32 i = 0; cnt; i++, cnt--) {
+      |                ^
+video.cc:725:16: warning: variable 'i' set but not used [-Wunused-but-set-variable=]
+  725 |       for (u32 i = 0; cnt; i++, cnt--) {
+      |                ^
+video.cc:763:18: warning: variable 'i' set but not used [-Wunused-but-set-variable=]
+  763 |         for (u32 i = 0; cnt; i++, cnt--) {
+      |                  ^
+video.cc: In instantiation of 'void render_affine_background(u32, u32, u32, const u8*, u32, const u8*, void*, const u16*) [with dtype = unsigned int; rendtype rdtype = STCKCOLOR; bool isbase = false; bool wrap = true; bool rotate = false; bool mosaic = true; u32 = unsigned int; u8 = unsigned char; u16 = short unsigned int]':
+video.cc:829:5:   required from 'void render_scanline_affine(u32, u32, u32, void*, const u16*) [with dsttype = unsigned int; rendtype rdtype = STCKCOLOR; bool isbase = false; u32 = unsigned int; u16 = short unsigned int]'
+  829 |     render_affine_background<dsttype, rdtype, isbase, true,  false, true>,
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+video.cc:1953:11:   required from 'void tile_render_layers(u32, u32, dsttype*, u32) [with rendtype bgmode = STCKCOLOR; rendtype objmode = STCKCOLOR; dsttype = unsigned int; u32 = unsigned int]'
+ 1953 |           render_scanline_affine<dsttype, bgmode, false>,
+      |           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+video.cc:2163:18:   required from here
+ 2163 |   .stacked     = tile_render_layers<STCKCOLOR, STCKCOLOR, u32>,
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+video.cc:669:16: warning: variable 'i' set but not used [-Wunused-but-set-variable=]
+  669 |       for (u32 i = 0; cnt; i++, cnt--) {
+      |                ^
+video.cc:690:16: warning: variable 'i' set but not used [-Wunused-but-set-variable=]
+  690 |       for (u32 i = 0; cnt; i++, cnt--) {
+      |                ^
+video.cc:725:16: warning: variable 'i' set but not used [-Wunused-but-set-variable=]
+  725 |       for (u32 i = 0; cnt; i++, cnt--) {
+      |                ^
+video.cc:763:18: warning: variable 'i' set but not used [-Wunused-but-set-variable=]
+  763 |         for (u32 i = 0; cnt; i++, cnt--) {
+      |                  ^
+video.cc: In instantiation of 'void render_affine_background(u32, u32, u32, const u8*, u32, const u8*, void*, const u16*) [with dtype = unsigned int; rendtype rdtype = STCKCOLOR; bool isbase = false; bool wrap = true; bool rotate = true; bool mosaic = false; u32 = unsigned int; u8 = unsigned char; u16 = short unsigned int]':
+video.cc:830:5:   required from 'void render_scanline_affine(u32, u32, u32, void*, const u16*) [with dsttype = unsigned int; rendtype rdtype = STCKCOLOR; bool isbase = false; u32 = unsigned int; u16 = short unsigned int]'
+  830 |     render_affine_background<dsttype, rdtype, isbase, true,  true,  false>,
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+video.cc:1953:11:   required from 'void tile_render_layers(u32, u32, dsttype*, u32) [with rendtype bgmode = STCKCOLOR; rendtype objmode = STCKCOLOR; dsttype = unsigned int; u32 = unsigned int]'
+ 1953 |           render_scanline_affine<dsttype, bgmode, false>,
+      |           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+video.cc:2163:18:   required from here
+ 2163 |   .stacked     = tile_render_layers<STCKCOLOR, STCKCOLOR, u32>,
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+video.cc:669:16: warning: variable 'i' set but not used [-Wunused-but-set-variable=]
+  669 |       for (u32 i = 0; cnt; i++, cnt--) {
+      |                ^
+video.cc:690:16: warning: variable 'i' set but not used [-Wunused-but-set-variable=]
+  690 |       for (u32 i = 0; cnt; i++, cnt--) {
+      |                ^
+video.cc:725:16: warning: variable 'i' set but not used [-Wunused-but-set-variable=]
+  725 |       for (u32 i = 0; cnt; i++, cnt--) {
+      |                ^
+video.cc:763:18: warning: variable 'i' set but not used [-Wunused-but-set-variable=]
+  763 |         for (u32 i = 0; cnt; i++, cnt--) {
+      |                  ^
+video.cc: In instantiation of 'void render_affine_background(u32, u32, u32, const u8*, u32, const u8*, void*, const u16*) [with dtype = unsigned int; rendtype rdtype = STCKCOLOR; bool isbase = false; bool wrap = true; bool rotate = true; bool mosaic = true; u32 = unsigned int; u8 = unsigned char; u16 = short unsigned int]':
+video.cc:831:5:   required from 'void render_scanline_affine(u32, u32, u32, void*, const u16*) [with dsttype = unsigned int; rendtype rdtype = STCKCOLOR; bool isbase = false; u32 = unsigned int; u16 = short unsigned int]'
+  831 |     render_affine_background<dsttype, rdtype, isbase, true,  true,  true>,
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+video.cc:1953:11:   required from 'void tile_render_layers(u32, u32, dsttype*, u32) [with rendtype bgmode = STCKCOLOR; rendtype objmode = STCKCOLOR; dsttype = unsigned int; u32 = unsigned int]'
+ 1953 |           render_scanline_affine<dsttype, bgmode, false>,
+      |           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+video.cc:2163:18:   required from here
+ 2163 |   .stacked     = tile_render_layers<STCKCOLOR, STCKCOLOR, u32>,
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+video.cc:669:16: warning: variable 'i' set but not used [-Wunused-but-set-variable=]
+  669 |       for (u32 i = 0; cnt; i++, cnt--) {
+      |                ^
+video.cc:690:16: warning: variable 'i' set but not used [-Wunused-but-set-variable=]
+  690 |       for (u32 i = 0; cnt; i++, cnt--) {
+      |                ^
+video.cc:725:16: warning: variable 'i' set but not used [-Wunused-but-set-variable=]
+  725 |       for (u32 i = 0; cnt; i++, cnt--) {
+      |                ^
+video.cc:763:18: warning: variable 'i' set but not used [-Wunused-but-set-variable=]
+  763 |         for (u32 i = 0; cnt; i++, cnt--) {
+      |                  ^
+/opt/devkitpro/devkitARM/bin/arm-none-eabi-gcc -I./libretro -I./libretro/libretro-common/include  -I./ -DGIT_VERSION=\""5819380"\" -DARM11 -D_3DS -march=armv6k -mtune=mpcore -mfloat-abi=hard -Wall -mword-relocations -fomit-frame-pointer -ffast-math -DHAVE_STRINGS_H -DHAVE_STDINT_H -DHAVE_INTTYPES_H -D__LIBRETRO__ -DINLINE=inline -Wall -DHAVE_DYNAREC -DARM_ARCH    -DFRONTEND_SUPPORTS_RGB565 -I/opt/devkitpro/libctru/include -O3 -DNDEBUG -c  -o 3ds/3ds_utils.o 3ds/3ds_utils.c
+In file included from 3ds/3ds_utils.c:5:
+/opt/devkitpro/libctru/include/3ds.h:12:2: warning: #warning "Please update your Makefile and replace -DARM11 -D_3DS with -D__3DS__" [-Wcpp]
+   12 | #warning "Please update your Makefile and replace -DARM11 -D_3DS with -D__3DS__"
+      |  ^~~~~~~
+/opt/devkitpro/devkitARM/bin/arm-none-eabi-gcc  -DGIT_VERSION=\""5819380"\" -DARM11 -D_3DS -march=armv6k -mtune=mpcore -mfloat-abi=hard -Wall -mword-relocations -fomit-frame-pointer -ffast-math -DHAVE_STRINGS_H -DHAVE_STDINT_H -DHAVE_INTTYPES_H -D__LIBRETRO__ -DINLINE=inline -Wall -DHAVE_DYNAREC -DARM_ARCH    -DFRONTEND_SUPPORTS_RGB565 -I/opt/devkitpro/libctru/include -O3 -DNDEBUG -c -o 3ds/3ds_cache_utils.o 3ds/3ds_cache_utils.S
+/opt/devkitpro/devkitARM/bin/arm-none-eabi-ar rcs gpsp_libretro_ctr.a ./main.o ./gba_memory.o ./savestate.o ./input.o ./sound.o ./cheats.o ./memmap.o ./serial.o ./gbp.o ./rfu.o ./serial_proto.o ./libretro/libretro.o ./gba_cc_lut.o ./libretro/libretro-common/compat/compat_posix_string.o ./libretro/libretro-common/compat/compat_strl.o ./libretro/libretro-common/compat/fopen_utf8.o ./libretro/libretro-common/encodings/encoding_utf.o ./libretro/libretro-common/file/file_path.o ./libretro/libretro-common/file/file_path_io.o ./libretro/libretro-common/streams/file_stream.o ./libretro/libretro-common/string/stdstring.o ./libretro/libretro-common/time/rtime.o ./libretro/libretro-common/vfs/vfs_implementation.o ./cpu_threaded.o ./bios_data.o ./arm/arm_stub.o ./video.o ./cpu.o 3ds/3ds_utils.o 3ds/3ds_cache_utils.o
+core/gpsp_libretro_ctr.a
